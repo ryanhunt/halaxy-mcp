@@ -27,6 +27,10 @@ Create an API key in Halaxy (Settings → API Keys) with whichever of these you 
 | Patients → Retrieve | Patient names/telecom/status in `list_appointments` |
 | Claims & Referrals → Retrieve Claim | `awaiting_insurer_invoice`, `list_invoices_by_payer` (this is Halaxy's plain-English label for read access to the FHIR `Coverage` resource) |
 
+Example of what this looks like in Halaxy's own API key scope screen (note "Claims & Referrals → Retrieve Referral" is also on here but not currently used by any tool in this repo - only `Retrieve Claim`, i.e. `Coverage`, is):
+
+![Halaxy API key scopes screen](docs/api-access-required.jpg)
+
 ## Patient data
 
 This server deliberately minimises what it exposes about a patient. Halaxy's `Patient` resource also carries DOB, address, gender, emergency contact, and referral-source notes - none of that is needed here, and it's enforced in code (`ALLOWED_PATIENT_FIELDS` in `halaxy_mcp.py`), not just by convention: every patient lookup is filtered down to `id`/`name`/`initials`/`telecom`/`patient_status`/`is_active_client` before it can reach the MCP client, regardless of what's asked for.
