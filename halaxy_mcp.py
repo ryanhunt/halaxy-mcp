@@ -15,6 +15,13 @@ membership and billing-target details (which entity gets invoiced for
 their sessions), not clinical claim data and not Medicare submission
 status.
 
+If the API key's scopes don't cover what a tool needs, Halaxy responds
+with a 401/403 or an OperationOutcome error - `_halaxy_get` detects that
+and raises HalaxyPermissionError with a clear message, rather than
+letting a caller like `_fetch_all` silently read the missing "entry" key
+as zero results (which would otherwise look identical to "no invoices
+today" instead of "this API key can't see invoices at all").
+
 Patient data is deliberately minimised: Halaxy's Patient resource also
 carries DOB, address, gender, emergency contact, and referral-source
 notes, but none of that is needed here. Every Patient lookup is filtered
@@ -97,8 +104,35 @@ def _get_access_token() -> str:
     return _token_cache["access_token"]
 
 
+class HalaxyPermissionError(RuntimeError):
+    """Raised when Halaxy rejects a request because the API key's scope doesn't allow it."""
+
+
+def _is_expired_token_error(data: dict) -> bool:
+    return data.get("resourceType") == "OperationOutcome" and data.get("issue", [{}])[0].get("code") == "expired"
+
+
+def _operation_outcome_message(data: dict) -> str:
+    """Best-effort human-readable text out of a FHIR OperationOutcome's issue list."""
+    issue = data.get("issue", [{}])[0]
+    return (
+        issue.get("diagnostics")
+        or issue.get("details", {}).get("text")
+        or issue.get("code")
+        or "no further detail in Halaxy's response"
+    )
+
+
 def _halaxy_get(path: str, params: dict) -> dict:
-    """GET a Halaxy FHIR endpoint with the current access token, retrying once on an expired token."""
+    """GET a Halaxy FHIR endpoint with the current access token, retrying once on an expired token.
+
+    Raises HalaxyPermissionError on a 401/403 or an OperationOutcome error
+    response, instead of silently handing that back as if it were real
+    data - a caller like `_fetch_all` would otherwise read an
+    OperationOutcome's absent "entry" key as zero results, quietly
+    reporting "no invoices"/"no appointments" instead of the actual
+    problem (most commonly: this scope isn't enabled on the API key).
+    """
     token = _get_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     url = f"{HALAXY_API_BASE}/{path}"
@@ -106,12 +140,23 @@ def _halaxy_get(path: str, params: dict) -> dict:
     response = httpx.get(url, params=params, headers=headers, timeout=20)
     data = response.json()
 
-    if data.get("resourceType") == "OperationOutcome" and data.get("issue", [{}])[0].get("code") == "expired":
+    if _is_expired_token_error(data):
         _token_cache["access_token"] = None
         token = _get_access_token()
         headers["Authorization"] = f"Bearer {token}"
         response = httpx.get(url, params=params, headers=headers, timeout=20)
         data = response.json()
+
+    if response.status_code in (401, 403) or (
+        data.get("resourceType") == "OperationOutcome"
+        and any(issue.get("severity") == "error" for issue in data.get("issue", []))
+    ):
+        resource = path.split("/", 1)[0]
+        raise HalaxyPermissionError(
+            f"Halaxy denied this request for {resource} (HTTP {response.status_code}): "
+            f"{_operation_outcome_message(data)}. This usually means the API key doesn't have "
+            f"the matching scope enabled - check Settings -> API Keys in Halaxy."
+        )
 
     return data
 
