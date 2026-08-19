@@ -127,12 +127,36 @@ Fully quit and reopen the app afterwards (not just close the window).
 
 No `env` block is needed in any of these - the script loads its own `.env` file from next to `halaxy_mcp.py`.
 
+## Docker / HTTP transport
+
+For a remote MCP client that connects from cloud infrastructure rather than a local device (Claude's "custom connector", Microsoft 365 Copilot's "federated connector"), run the same script over HTTP instead of stdio: `MCP_TRANSPORT=http` starts a `uvicorn` server instead of talking over stdin/stdout - the Dockerfile sets this for you.
+
+**Auth**: every request except `GET /health` must carry `Authorization: Bearer <MCP_SERVER_TOKEN>` (set in `.env`, generate with `openssl rand -hex 32`) - checked by a small ASGI middleware, deliberately a plain shared secret rather than the `mcp` SDK's OAuth-oriented auth (which expects a real authorization server issuing tokens). Whether your MCP client's connector setup actually accepts a raw bearer token like this, or expects a full OAuth flow instead, is worth checking against its real UI before relying on this - it varies by client and changes over time.
+
+**Test locally** (no TLS - fine for local testing, not for internet exposure):
+
+```bash
+cp .env.example .env   # fill in your Halaxy credentials + MCP_SERVER_TOKEN
+docker compose up --build
+curl http://127.0.0.1:8000/health   # -> 200, no auth needed
+curl http://127.0.0.1:8000/mcp      # -> 401, no token
+```
+
+**Deploy it somewhere internet-facing** (e.g. a Raspberry Pi behind your own router): use `docker-compose.pi.yml` instead, which adds [Caddy](https://caddyserver.com/) in front for TLS (Let's Encrypt, auto-issued/renewed) and doesn't publish the app's port directly - only Caddy is reachable from outside the container network.
+
+```bash
+cp Caddyfile.example Caddyfile   # edit in your real domain/DDNS hostname
+docker compose -f docker-compose.pi.yml up -d --build
+```
+
+You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of `MCP_SERVER_TOKEN`, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges (these change over time, so check the current values rather than hardcoding them).
+
 ## Known limitations, worth knowing about
 
 - **`list_invoices`'s lookback window can miss invoices.** Halaxy's `Invoice` search has no parameter for the invoice's own `date` field, only `created`/`_lastUpdated` - so `list_invoices` fetches invoices created in the last 45 days and filters client-side for an exact `date` match. Insurer/employer-billed invoices (e.g. workers' comp) are sometimes created months before the session they end up dated for, which can fall outside that window. `list_appointments` doesn't have this problem (it follows the appointment→invoice link directly), and `list_invoices_by_payer` doesn't either (it searches by recipient, unbounded by date) - prefer those when the date-based blind spot matters.
 - **`session` vs. `meeting` is inferred from whether the appointment has a linked `Patient` participant**, not from any explicit Halaxy field - a real session booked without linking a patient record in Halaxy would be miscategorised as a meeting.
 - No write operations (create/update anything) are implemented, on purpose.
-- stdio transport only - a remote/HTTP variant (for hosting this somewhere reachable by a cloud-based MCP client, e.g. a custom connector) isn't built yet.
+- The HTTP transport's bearer-token auth is a plain shared secret, not a full OAuth flow - see [Docker / HTTP transport](#docker--http-transport) above for why, and check what your specific MCP client's connector setup actually requires before relying on it for an internet-facing deployment.
 
 ## What it deliberately doesn't do
 

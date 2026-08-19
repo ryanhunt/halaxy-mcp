@@ -34,10 +34,11 @@ Patient data - if asked for a patient's DOB/address/gender, the correct
 answer is that this server cannot provide it, not an attempt to fetch it
 some other way.
 
-Transport: stdio only, for local testing via Claude Desktop's
-claude_desktop_config.json. The HTTP/remote version (for the
-Raspberry Pi + Caddy + Cowork setup) is a follow-up step once this
-is confirmed working end to end.
+Transport: stdio (default, for Claude Desktop's local subprocess model)
+or http (MCP_TRANSPORT=http - for Docker/the Raspberry Pi deployment,
+reachable by remote MCP clients like Claude's custom connectors or
+Microsoft 365 Copilot). See README.md's "Docker / HTTP transport"
+section.
 """
 
 import json
@@ -60,6 +61,17 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 HALAXY_API_BASE = os.environ.get("HALAXY_API_BASE", "https://au-api.halaxy.com/main").rstrip("/")
 HALAXY_CLIENT_ID = os.environ.get("HALAXY_CLIENT_ID")
 HALAXY_CLIENT_SECRET = os.environ.get("HALAXY_CLIENT_SECRET")
+
+# Transport selection - stdio (default, for Claude Desktop's local subprocess
+# model) vs. http (for the Docker/Pi deployment, reachable by remote MCP
+# clients like Claude's custom connectors or Microsoft 365 Copilot). Named
+# MCP_SERVER_TOKEN, not "API key", deliberately - it's a shared secret this
+# server itself requires from its callers, unrelated to HALAXY_CLIENT_SECRET
+# (which is this server's own credential *to* Halaxy).
+MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+MCP_SERVER_TOKEN = os.environ.get("MCP_SERVER_TOKEN")
 
 PRACTICE_TIMEZONE = ZoneInfo("Australia/Sydney")
 
@@ -161,7 +173,15 @@ def _halaxy_get(path: str, params: dict) -> dict:
     return data
 
 
-mcp = FastMCP("halaxy-mcp")
+mcp = FastMCP("halaxy-mcp", host=MCP_HOST, port=MCP_PORT)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def _health(request):
+    """Unauthenticated liveness check - for Docker/Caddy, not a real tool."""
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
 
 # Halaxy's Invoice endpoint has NO search parameter for the invoice's own
 # "date" field - confirmed live against Halaxy's CapabilityStatement
@@ -953,5 +973,55 @@ def list_referrals(flag: str | None = None) -> str:
     )
 
 
+class _BearerAuthMiddleware:
+    """Reject any request without `Authorization: Bearer <MCP_SERVER_TOKEN>`.
+
+    Deliberately a plain shared-secret check, not the mcp SDK's built-in
+    OAuth-oriented auth (which expects a real OAuth authorization server
+    issuing tokens - overkill for a single-tenant server with one shared
+    secret). `/health` is exempt so Docker/Caddy health checks don't need
+    the secret. This is ASGI middleware, not Starlette's BaseHTTPMiddleware,
+    so it works with the streamable-http app's use of long-lived/streaming
+    connections without buffering them.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] == "/health":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope["headers"])
+        auth = headers.get(b"authorization", b"").decode()
+        if auth != f"Bearer {MCP_SERVER_TOKEN}":
+            from starlette.responses import JSONResponse
+
+            response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def _run_http() -> None:
+    if not MCP_SERVER_TOKEN:
+        raise RuntimeError(
+            "MCP_TRANSPORT=http requires MCP_SERVER_TOKEN to be set - a shared secret that "
+            "remote MCP clients must send as 'Authorization: Bearer <token>'. Generate one "
+            "yourself (e.g. `openssl rand -hex 32`) and set it in the environment."
+        )
+
+    import uvicorn
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(_BearerAuthMiddleware)
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
+
+
 if __name__ == "__main__":
-    mcp.run()
+    if MCP_TRANSPORT == "http":
+        _run_http()
+    else:
+        mcp.run()

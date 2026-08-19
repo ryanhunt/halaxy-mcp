@@ -1,0 +1,12 @@
+# Local testing (Mac, or the Pi itself before adding TLS) - plain HTTP,
+# published to localhost only. For an actual internet-facing deployment,
+# use docker-compose.pi.yml instead, which adds Caddy for TLS and doesn't
+# publish this service's port directly.
+services:
+  halaxy-mcp:
+    build: .
+    image: halaxy-mcp:local
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped

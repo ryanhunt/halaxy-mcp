@@ -1,0 +1,6 @@
+# Copy this to `Caddyfile` and replace with your real domain (e.g. a
+# Unifi Dynamic DNS hostname). Caddy automatically obtains and renews a
+# Let's Encrypt certificate for it - no manual cert handling needed.
+your-domain.example.com {
+	reverse_proxy halaxy-mcp:8000
+}
