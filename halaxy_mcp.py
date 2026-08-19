@@ -585,6 +585,131 @@ def _get_patient_insurer_coverage(patient_id: str) -> dict | None:
     return coverage_result
 
 
+_practitioner_name_cache: dict[str, str | None] = {}
+
+
+def _get_practitioner_name(practitioner_id: str) -> str | None:
+    """Resolve a Practitioner (not PractitionerRole) ID to a name - referrals reference both types."""
+    if practitioner_id not in _practitioner_name_cache:
+        practitioner = _halaxy_get(f"Practitioner/{practitioner_id}", {})
+        _practitioner_name_cache[practitioner_id] = (
+            _human_name(practitioner.get("name", [])) if practitioner.get("resourceType") == "Practitioner" else None
+        )
+    return _practitioner_name_cache[practitioner_id]
+
+
+def _resolve_actor_name(actor_ref: dict, practitioner_role_names: dict) -> str | None:
+    """Resolve a FHIR reference that's either a Practitioner or a PractitionerRole to a display name."""
+    ref_id = _ref_id((actor_ref or {}).get("reference"))
+    if not ref_id:
+        return None
+    if actor_ref.get("type") == "PractitionerRole":
+        return practitioner_role_names.get(ref_id, {}).get("name")
+    return _get_practitioner_name(ref_id)
+
+
+_referral_definition_name_cache: dict[str, str | None] = {}
+
+
+def _get_referral_definition_name(definition_id: str) -> str | None:
+    """The referral type's name, e.g. "Medicare: MHTP Referral" - a small, effectively static set."""
+    if definition_id not in _referral_definition_name_cache:
+        definition = _halaxy_get(f"ReferralDefinition/{definition_id}", {})
+        _referral_definition_name_cache[definition_id] = (
+            definition.get("name") if definition.get("resourceType") == "ReferralDefinition" else None
+        )
+    return _referral_definition_name_cache[definition_id]
+
+
+# How soon a referral's expiry counts as "coming up" - confirmed live this
+# has to be computed here, not trusted from Halaxy's own `active` flag:
+# Halaxy doesn't appear to auto-flip a referral to inactive just because
+# its period has lapsed.
+REFERRAL_EXPIRING_SOON_DAYS = 30
+
+
+def _referral_flags(referral: dict, today) -> list[str]:
+    flags = []
+    limit_quantity = referral.get("limitQuantity", {})
+    total = limit_quantity.get("quantity", {}).get("value")
+    used = limit_quantity.get("quantityUsed")
+    if total is not None and used is not None and used >= total:
+        flags.append("over_limit")
+
+    end = referral.get("period", {}).get("end")
+    if end:
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+        if end_date < today:
+            flags.append("expired")
+        elif (end_date - today).days <= REFERRAL_EXPIRING_SOON_DAYS:
+            flags.append("expiring_soon")
+
+    return flags
+
+
+def _referral_summary(referral: dict, practitioner_role_names: dict) -> dict:
+    """Reduce a Referral resource to what's useful for tracking session/dollar limits and expiry.
+
+    Confirmed live: Halaxy models a Medicare Mental Health Treatment Plan
+    (and similar - DVA, WorkCover) as a Referral with a `limitQuantity`
+    (sessions authorized + already used) and/or a `limitMoney` (dollar cap
+    + used) - "sessions_remaining" is total minus used, computed here
+    since Halaxy doesn't return it directly. A patient can have more than
+    one simultaneously active Referral (seen live - e.g. one per
+    referred-to practitioner), so this deliberately doesn't try to pick
+    "the" one; callers get the full list.
+    """
+    limit_quantity = referral.get("limitQuantity", {})
+    total = limit_quantity.get("quantity", {}).get("value")
+    used = limit_quantity.get("quantityUsed")
+    limit_money = referral.get("limitMoney", {})
+    referral_definition_id = _ref_id(referral.get("referralDefinition", {}).get("reference"))
+
+    return {
+        "id": referral.get("id"),
+        "referral_type": _get_referral_definition_name(referral_definition_id) if referral_definition_id else None,
+        "referring_practitioner": _resolve_actor_name(referral.get("requester"), practitioner_role_names),
+        "referred_to_practitioner": _resolve_actor_name(referral.get("performer"), practitioner_role_names),
+        "period_start": referral.get("period", {}).get("start"),
+        "period_end": referral.get("period", {}).get("end"),
+        "sessions_total": total,
+        "sessions_used": used,
+        "sessions_remaining": (total - used) if total is not None and used is not None else None,
+        "amount_total": limit_money.get("amount", {}).get("value"),
+        "amount_used": limit_money.get("amountUsed"),
+        # Some referrals in this account have no referralDefinition/requester
+        # at all - just a free-text comment naming the referrer (confirmed
+        # live) - surfaced as the only clue available in that case.
+        "comment": referral.get("comment"),
+        "flags": _referral_flags(referral, datetime.now(PRACTICE_TIMEZONE).date()),
+    }
+
+
+PATIENT_REFERRAL_CACHE_TTL_SECONDS = 6 * 60 * 60
+_patient_referral_cache: dict[str, dict] = {}
+
+
+def _get_patient_active_referrals(patient_id: str) -> list[dict]:
+    """The patient's active Referral(s) (Medicare MHTP, DVA, WorkCover, etc.), most recent first."""
+    cached = _patient_referral_cache.get(patient_id)
+    if cached is not None and time.time() < cached["expires_at"]:
+        return cached["referrals"]
+
+    practitioner_role_names = _get_practitioner_role_names()
+    referrals = [
+        _referral_summary(referral, practitioner_role_names)
+        for referral in _fetch_all("Referral", {"subject": f"Patient/{patient_id}"})
+        if referral.get("active")
+    ]
+    referrals.sort(key=lambda referral: referral["period_start"] or "", reverse=True)
+
+    _patient_referral_cache[patient_id] = {
+        "referrals": referrals,
+        "expires_at": time.time() + PATIENT_REFERRAL_CACHE_TTL_SECONDS,
+    }
+    return referrals
+
+
 @mcp.tool()
 def list_appointments(date: str | None = None, appointment_type: str | None = None) -> str:
     """List appointments for a given day, each tagged as a client "session" or a "meeting".
@@ -627,11 +752,19 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     to a specific insurer, but hasn't been yet. Use `list_invoices_by_payer`
     to check that insurer's actual invoice history.
 
+    Sessions also carry `referrals` - the patient's active Referral(s)
+    (e.g. a Medicare Mental Health Treatment Plan), each with sessions/
+    dollars authorized vs. used, expiry, and `flags` ("over_limit",
+    "expiring_soon", "expired"). Usually one, but a patient can have more
+    than one active at once (e.g. one per referred-to practitioner) - an
+    empty list means no active referral on file, not necessarily that
+    they're self-referred (some funding types don't use Referral at all).
+
     Returns:
         JSON with the target date and each appointment's type, time,
         description, session mode, patient (id/name/initials/telecom, or
         null for a meeting), practitioner name (and role ID), linked
-        invoice details (or null), and awaiting_insurer_invoice.
+        invoice details (or null), awaiting_insurer_invoice, and referrals.
     """
     if date is None:
         date = datetime.now(PRACTICE_TIMEZONE).strftime("%Y-%m-%d")
@@ -696,6 +829,11 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
             if invoice is None and item["appointment_type"] == "session" and item["patient"]
             else None
         )
+        item["referrals"] = (
+            _get_patient_active_referrals(item["patient"]["id"])
+            if item["appointment_type"] == "session" and item["patient"]
+            else []
+        )
 
     return json.dumps(
         {"queried_date": date, "appointment_count": len(parsed), "appointments": parsed},
@@ -756,6 +894,61 @@ def list_invoices_by_payer(payer_name: str) -> str:
             "invoice_count": len(invoices),
             "invoices": invoices,
         },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def list_referrals(flag: str | None = None) -> str:
+    """List every active Referral in the practice, with session/dollar limits, expiry, and status flags.
+
+    A Referral is Halaxy's model for a GP/other referral authorizing a
+    set number of sessions and/or dollars under a funding scheme - most
+    commonly a Medicare Mental Health Treatment Plan (6 sessions to
+    start), but also DVA, WorkCover, etc. Confirmed live against real
+    referrals in this account.
+
+    Each referral carries `flags`, computed here (not trusted from
+    Halaxy's own `active` field, which doesn't appear to auto-update on
+    expiry):
+      - "over_limit" - sessions used >= sessions authorized
+      - "expiring_soon" - period ends within 30 days
+      - "expired" - period has already ended
+
+    Use this for practice-wide sweeps ("who's about to run out of
+    sessions", "whose plan is expiring soon", "who's gone over their
+    referral cap and needs a new GP referral"). For a specific client's
+    current session count while looking at their appointments, see the
+    `referrals` field on `list_appointments`.
+
+    Args:
+        flag: Optionally filter to just one of "over_limit", "expiring_soon",
+            or "expired". Omit to return every active referral.
+
+    Returns:
+        JSON list of referrals, each with the patient (id/name/initials/
+        telecom), referral type, referring/referred-to practitioner,
+        period, sessions/dollars total vs. used vs. remaining, and flags.
+    """
+    if flag not in (None, "over_limit", "expiring_soon", "expired"):
+        raise ValueError('flag must be "over_limit", "expiring_soon", "expired", or omitted')
+
+    practitioner_role_names = _get_practitioner_role_names()
+    referrals = []
+    for referral in _fetch_all("Referral", {}):
+        if not referral.get("active"):
+            continue
+        summary = _referral_summary(referral, practitioner_role_names)
+        if flag and flag not in summary["flags"]:
+            continue
+        patient_id = _ref_id(referral.get("subject", {}).get("reference"))
+        summary["patient"] = _get_patient(patient_id) if patient_id else None
+        referrals.append(summary)
+
+    referrals.sort(key=lambda r: r["period_end"] or "")
+
+    return json.dumps(
+        {"flag": flag, "referral_count": len(referrals), "referrals": referrals},
         indent=2,
     )
 
