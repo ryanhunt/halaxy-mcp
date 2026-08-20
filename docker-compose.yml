@@ -7,6 +7,12 @@ services:
     build: .
     image: halaxy-mcp:local
     env_file: .env
+    environment:
+      # The Dockerfile sets MCP_HOST=0.0.0.0 (so the container is
+      # reachable at all), but that's not a usable OAuth redirect target
+      # from the host/browser - override the public URL explicitly to
+      # match where this is actually published below.
+      MCP_PUBLIC_URL: http://127.0.0.1:8000
     ports:
       - "127.0.0.1:8000:8000"
     restart: unless-stopped

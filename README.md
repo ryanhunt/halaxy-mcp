@@ -133,32 +133,39 @@ No `env` block is needed in any of these - the script loads its own `.env` file 
 
 For a remote MCP client that connects from cloud infrastructure rather than a local device (Claude's "custom connector", Microsoft 365 Copilot's "federated connector"), run the same script over HTTP instead of stdio: `MCP_TRANSPORT=http` starts a `uvicorn` server instead of talking over stdin/stdout - the Dockerfile sets this for you.
 
-**Auth**: every request except `GET /health` must carry `Authorization: Bearer <MCP_SERVER_TOKEN>` (set in `.env`, generate with `openssl rand -hex 32`) - checked by a small ASGI middleware, deliberately a plain shared secret rather than the `mcp` SDK's OAuth-oriented auth (which expects a real authorization server issuing tokens). Whether your MCP client's connector setup actually accepts a raw bearer token like this, or expects a full OAuth flow instead, is worth checking against its real UI before relying on this - it varies by client and changes over time.
+**Auth**: real OAuth 2.1, not a static token. Confirmed against Claude's actual "Add custom connector" dialog: it requires a genuine OAuth flow (there's no field to paste a bearer token into - only optional "OAuth Client ID/Secret" fields, left blank since this server supports Dynamic Client Registration and Claude registers itself automatically).
+
+Rather than standing up a separate identity provider, this server acts as its own minimal, self-contained OAuth authorization server - adapted from Anthropic's own reference pattern ([`examples/servers/simple-auth`](https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/servers/simple-auth) in `modelcontextprotocol/python-sdk`, the "legacy" combined authorization-server-plus-resource-server mode). `_SimpleOAuthProvider` handles client registration, `/authorize`, a plain login page (`/login`), authorization codes, and access tokens, all kept in-memory (lost on restart - fine for a small internal tool). "Signing in" is one shared username/password (`MCP_LOGIN_USERNAME`/`MCP_LOGIN_PASSWORD` in `.env`) - not a per-person identity system, which is a reasonable simplification for a small practice/team. `MCP_PUBLIC_URL` is the public HTTPS URL clients actually reach this server at (behind Caddy on a real deployment) - the OAuth issuer/redirect base, and *not* the same as the internal `MCP_HOST`/`MCP_PORT` the container binds to.
 
 **Test locally** (no TLS - fine for local testing, not for internet exposure):
 
 ```bash
-cp .env.example .env   # fill in your Halaxy credentials + MCP_SERVER_TOKEN
+cp .env.example .env   # fill in your Halaxy credentials + MCP_LOGIN_USERNAME/PASSWORD
 docker compose up --build
 curl http://127.0.0.1:8000/health   # -> 200, no auth needed
 curl http://127.0.0.1:8000/mcp      # -> 401, no token
+curl http://127.0.0.1:8000/.well-known/oauth-authorization-server  # -> OAuth discovery metadata
 ```
+
+An MCP client does the rest automatically (register → authorize → login → token exchange) - verified this full flow by hand with curl through the actual container before relying on it.
 
 **Deploy it somewhere internet-facing** (e.g. a Raspberry Pi behind your own router): use `docker-compose.pi.yml` instead, which adds [Caddy](https://caddyserver.com/) in front for TLS (Let's Encrypt, auto-issued/renewed) and doesn't publish the app's port directly - only Caddy is reachable from outside the container network.
 
 ```bash
 cp Caddyfile.example Caddyfile   # edit in your real domain/DDNS hostname
+# In .env: set MCP_PUBLIC_URL to that same https://your-domain - it must
+# match what clients actually connect to.
 docker compose -f docker-compose.pi.yml up -d --build
 ```
 
-You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of `MCP_SERVER_TOKEN`, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges (these change over time, so check the current values rather than hardcoding them).
+You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of the login gate, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges (these change over time, so check the current values rather than hardcoding them).
 
 ## Known limitations, worth knowing about
 
 - **`list_invoices`'s lookback window can miss invoices.** Halaxy's `Invoice` search has no parameter for the invoice's own `date` field, only `created`/`_lastUpdated` - so `list_invoices` fetches invoices created in the last 45 days and filters client-side for an exact `date` match. Insurer/employer-billed invoices (e.g. workers' comp) are sometimes created months before the session they end up dated for, which can fall outside that window. `list_appointments` doesn't have this problem (it follows the appointment→invoice link directly), and `list_invoices_by_payer` doesn't either (it searches by recipient, unbounded by date) - prefer those when the date-based blind spot matters.
 - **`session` vs. `meeting` is inferred from whether the appointment has a linked `Patient` participant**, not from any explicit Halaxy field - a real session booked without linking a patient record in Halaxy would be miscategorised as a meeting.
 - No write operations (create/update anything) are implemented, on purpose.
-- The HTTP transport's bearer-token auth is a plain shared secret, not a full OAuth flow - see [Docker / HTTP transport](#docker--http-transport) above for why, and check what your specific MCP client's connector setup actually requires before relying on it for an internet-facing deployment.
+- The HTTP transport's OAuth authorization server is a minimal, self-contained implementation with one shared login (not per-person accounts) and in-memory state (tokens don't survive a restart) - see [Docker / HTTP transport](#docker--http-transport) above. Verified working against Claude's connector requirements specifically; other MCP clients may expect something different.
 
 ## What it deliberately doesn't do
 

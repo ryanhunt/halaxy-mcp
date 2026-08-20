@@ -44,6 +44,7 @@ section.
 import json
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -51,7 +52,21 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 # Load .env from next to this script, not from whatever directory the
 # process happens to be launched from (Claude Desktop won't necessarily
@@ -64,14 +79,26 @@ HALAXY_CLIENT_SECRET = os.environ.get("HALAXY_CLIENT_SECRET")
 
 # Transport selection - stdio (default, for Claude Desktop's local subprocess
 # model) vs. http (for the Docker/Pi deployment, reachable by remote MCP
-# clients like Claude's custom connectors or Microsoft 365 Copilot). Named
-# MCP_SERVER_TOKEN, not "API key", deliberately - it's a shared secret this
-# server itself requires from its callers, unrelated to HALAXY_CLIENT_SECRET
-# (which is this server's own credential *to* Halaxy).
+# clients like Claude's custom connectors or Microsoft 365 Copilot).
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
-MCP_SERVER_TOKEN = os.environ.get("MCP_SERVER_TOKEN")
+
+# The public HTTPS URL remote MCP clients actually reach this server at
+# (behind Caddy on the real deployment) - NOT the internal MCP_HOST/
+# MCP_PORT the container binds to. Used as the OAuth issuer URL and to
+# build the login page's callback URL. For local testing without TLS,
+# e.g. http://127.0.0.1:8000.
+MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", f"http://{MCP_HOST}:{MCP_PORT}")
+
+# Confirmed live (screenshot of Claude's real "Add custom connector"
+# dialog): it requires a genuine OAuth flow - there's no field anywhere
+# to paste in a static bearer token - so MCP_LOGIN_USERNAME/PASSWORD gate
+# a real (if minimal) login page, not a header value. One shared login
+# for the practice, not per-person; see the OAuth provider below for why
+# that's a reasonable choice here.
+MCP_LOGIN_USERNAME = os.environ.get("MCP_LOGIN_USERNAME")
+MCP_LOGIN_PASSWORD = os.environ.get("MCP_LOGIN_PASSWORD")
 
 PRACTICE_TIMEZONE = ZoneInfo("Australia/Sydney")
 
@@ -173,7 +200,203 @@ def _halaxy_get(path: str, params: dict) -> dict:
     return data
 
 
-mcp = FastMCP("halaxy-mcp", host=MCP_HOST, port=MCP_PORT)
+MCP_OAUTH_SCOPE = "mcp"
+
+
+class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
+    """Minimal self-contained OAuth 2.1 authorization server for this MCP server.
+
+    Adapted from Anthropic's own reference pattern
+    (modelcontextprotocol/python-sdk, examples/servers/simple-auth, the
+    "legacy" combined authorization-server-plus-resource-server mode) for
+    a single-tenant server with one shared login, rather than a plain
+    bearer token: confirmed live (screenshot of the real "Add custom
+    connector" dialog) that Claude's connector setup requires a genuine
+    OAuth flow with Dynamic Client Registration - there's no field to
+    paste a static token into at all.
+
+    Deliberately in-memory (registered clients, authorization codes, and
+    access tokens are all lost on a restart, forcing reconnect) -
+    acceptable for a small internal tool with no real user database.
+    "Signing in" is one shared username/password (MCP_LOGIN_USERNAME/
+    PASSWORD) gating a plain login page, not a per-person identity system
+    - reasonable for a two-person practice; swapping the single
+    username/password check in `handle_login` for a lookup against a
+    small dict of accounts would extend this to per-person logins if that
+    's ever wanted instead.
+    """
+
+    def __init__(self):
+        self.clients: dict[str, OAuthClientInformationFull] = {}
+        self.auth_codes: dict[str, AuthorizationCode] = {}
+        self.tokens: dict[str, AccessToken] = {}
+        self.state_mapping: dict[str, dict[str, str | None]] = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self.clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        if not client_info.client_id:
+            raise ValueError("No client_id provided")
+        self.clients[client_info.client_id] = client_info
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        """Called as part of Claude's /authorize request - send it on to our own login page."""
+        state = params.state or secrets.token_hex(16)
+        self.state_mapping[state] = {
+            "redirect_uri": str(params.redirect_uri),
+            "code_challenge": params.code_challenge,
+            "redirect_uri_provided_explicitly": str(params.redirect_uri_provided_explicitly),
+            "client_id": client.client_id,
+            "resource": params.resource,
+        }
+        return f"{MCP_PUBLIC_URL}/login?state={state}&client_id={client.client_id}"
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        return self.auth_codes.get(authorization_code)
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        if authorization_code.code not in self.auth_codes:
+            raise ValueError("Invalid authorization code")
+        if not client.client_id:
+            raise ValueError("No client_id provided")
+
+        token = f"mcp_{secrets.token_hex(32)}"
+        self.tokens[token] = AccessToken(
+            token=token,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + 3600,
+            resource=authorization_code.resource,
+            subject=authorization_code.subject,
+        )
+        del self.auth_codes[authorization_code.code]
+
+        return OAuthToken(
+            access_token=token,
+            token_type="Bearer",
+            expires_in=3600,
+            scope=" ".join(authorization_code.scopes),
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        access_token = self.tokens.get(token)
+        if not access_token:
+            return None
+        if access_token.expires_at and access_token.expires_at < time.time():
+            del self.tokens[token]
+            return None
+        return access_token
+
+    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
+        return None
+
+    async def exchange_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
+    ) -> OAuthToken:
+        raise NotImplementedError("Refresh tokens aren't supported - reconnect the connector instead")
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        if token.token in self.tokens:
+            del self.tokens[token.token]
+
+    def login_page_html(self, state: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Halaxy MCP - Sign in</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 420px; margin: 80px auto; padding: 0 20px; }}
+            .form-group {{ margin-bottom: 15px; }}
+            input {{ width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; }}
+            button {{ background-color: #4CAF50; color: white; padding: 10px 15px; border: none; cursor: pointer; }}
+        </style>
+        </head>
+        <body>
+            <h2>Halaxy MCP</h2>
+            <form action="{MCP_PUBLIC_URL}/login/callback" method="post">
+                <input type="hidden" name="state" value="{state}">
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" name="username" required autofocus>
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" name="password" required>
+                </div>
+                <button type="submit">Sign in</button>
+            </form>
+        </body>
+        </html>
+        """
+
+    async def handle_login_page(self, request: Request) -> Response:
+        state = request.query_params.get("state")
+        if not state:
+            raise HTTPException(400, "Missing state parameter")
+        return HTMLResponse(self.login_page_html(state))
+
+    async def handle_login_callback(self, request: Request) -> Response:
+        form = await request.form()
+        username, password, state = form.get("username"), form.get("password"), form.get("state")
+        if not isinstance(username, str) or not isinstance(password, str) or not isinstance(state, str):
+            raise HTTPException(400, "Missing username, password, or state parameter")
+
+        state_data = self.state_mapping.get(state)
+        if not state_data:
+            raise HTTPException(400, "Invalid or expired state parameter - try connecting again")
+
+        if not MCP_LOGIN_USERNAME or not MCP_LOGIN_PASSWORD:
+            raise HTTPException(500, "Server has no MCP_LOGIN_USERNAME/PASSWORD configured")
+        if not (secrets.compare_digest(username, MCP_LOGIN_USERNAME) and secrets.compare_digest(password, MCP_LOGIN_PASSWORD)):
+            raise HTTPException(401, "Invalid credentials")
+
+        redirect_uri = state_data["redirect_uri"]
+        code_challenge = state_data["code_challenge"]
+        client_id = state_data["client_id"]
+        assert redirect_uri is not None and client_id is not None
+
+        new_code = f"mcp_{secrets.token_hex(16)}"
+        self.auth_codes[new_code] = AuthorizationCode(
+            code=new_code,
+            client_id=client_id,
+            redirect_uri=AnyHttpUrl(redirect_uri),
+            redirect_uri_provided_explicitly=state_data["redirect_uri_provided_explicitly"] == "True",
+            expires_at=time.time() + 300,
+            scopes=[MCP_OAUTH_SCOPE],
+            code_challenge=code_challenge,
+            resource=state_data.get("resource"),
+            subject=username,
+        )
+        del self.state_mapping[state]
+
+        return RedirectResponse(url=construct_redirect_uri(redirect_uri, code=new_code, state=state), status_code=302)
+
+
+_oauth_provider = _SimpleOAuthProvider()
+
+mcp = FastMCP(
+    "halaxy-mcp",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    auth_server_provider=_oauth_provider,
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(MCP_PUBLIC_URL),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=[MCP_OAUTH_SCOPE],
+            default_scopes=[MCP_OAUTH_SCOPE],
+        ),
+        required_scopes=[MCP_OAUTH_SCOPE],
+        # No separate resource server - this server is both AS and RS
+        # ("legacy" combined mode), matching the reference pattern above.
+        resource_server_url=None,
+    ),
+)
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -182,6 +405,16 @@ async def _health(request):
     from starlette.responses import PlainTextResponse
 
     return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/login", methods=["GET"])
+async def _login_page(request: Request) -> Response:
+    return await _oauth_provider.handle_login_page(request)
+
+
+@mcp.custom_route("/login/callback", methods=["POST"])
+async def _login_callback(request: Request) -> Response:
+    return await _oauth_provider.handle_login_callback(request)
 
 # Halaxy's Invoice endpoint has NO search parameter for the invoice's own
 # "date" field - confirmed live against Halaxy's CapabilityStatement
@@ -1024,51 +1257,17 @@ def list_referrals(flag: str | None = None) -> str:
     )
 
 
-class _BearerAuthMiddleware:
-    """Reject any request without `Authorization: Bearer <MCP_SERVER_TOKEN>`.
-
-    Deliberately a plain shared-secret check, not the mcp SDK's built-in
-    OAuth-oriented auth (which expects a real OAuth authorization server
-    issuing tokens - overkill for a single-tenant server with one shared
-    secret). `/health` is exempt so Docker/Caddy health checks don't need
-    the secret. This is ASGI middleware, not Starlette's BaseHTTPMiddleware,
-    so it works with the streamable-http app's use of long-lived/streaming
-    connections without buffering them.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] == "/health":
-            await self.app(scope, receive, send)
-            return
-
-        headers = dict(scope["headers"])
-        auth = headers.get(b"authorization", b"").decode()
-        if auth != f"Bearer {MCP_SERVER_TOKEN}":
-            from starlette.responses import JSONResponse
-
-            response = JSONResponse({"error": "unauthorized"}, status_code=401)
-            await response(scope, receive, send)
-            return
-
-        await self.app(scope, receive, send)
-
-
 def _run_http() -> None:
-    if not MCP_SERVER_TOKEN:
+    if not MCP_LOGIN_USERNAME or not MCP_LOGIN_PASSWORD:
         raise RuntimeError(
-            "MCP_TRANSPORT=http requires MCP_SERVER_TOKEN to be set - a shared secret that "
-            "remote MCP clients must send as 'Authorization: Bearer <token>'. Generate one "
-            "yourself (e.g. `openssl rand -hex 32`) and set it in the environment."
+            "MCP_TRANSPORT=http requires MCP_LOGIN_USERNAME and MCP_LOGIN_PASSWORD to be set - "
+            "the credentials the OAuth login page checks. Pick a username and a strong password "
+            "and set them in the environment."
         )
 
     import uvicorn
 
-    app = mcp.streamable_http_app()
-    app.add_middleware(_BearerAuthMiddleware)
-    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
+    uvicorn.run(mcp.streamable_http_app(), host=MCP_HOST, port=MCP_PORT)
 
 
 if __name__ == "__main__":
