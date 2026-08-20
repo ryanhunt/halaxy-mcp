@@ -4,13 +4,15 @@ An [MCP](https://modelcontextprotocol.io) server for the [Halaxy](https://www.ha
 
 This is a small, single-tenant tool built for one practice's own use, not a general-purpose Halaxy SDK - see [What it deliberately doesn't do](#what-it-deliberately-doesnt-do) below.
 
+**⚠️ Read [DISCLAIMER.md](DISCLAIMER.md) before using this with real patient data.** Provided as-is, no warranty, no support commitment - and using it doesn't make *your* deployment compliant with privacy law. That's on you to assess, not this codebase.
+
 ## Tools
 
-- **`list_invoices(date)`** - invoices dated a given day (defaults to today). Each invoice has a `payer_name` (always present) and a `patient` object (only present when the payer is an actual patient, not an insurer/employer).
+- **`list_invoices(date)`** - invoices dated a given day (defaults to today). Each invoice has `patient_id` (a bare Halaxy ID, only present when the payer is an actual patient), a `funding_type` (`"self"` or `"organisation"` - see [Patient data](#patient-data) below), and a `payer_name` (only present when `funding_type` is `"organisation"`).
 - **`list_appointments(date, appointment_type)`** - appointments for a given day, each tagged `"session"` (a real client appointment) or `"meeting"` (a blocker/reminder/internal note - anything with no linked patient). Sessions also carry:
   - `session_mode` - `"F2F"` or `"Telehealth"`, resolved from the HealthcareService the appointment is booked against
-  - `patient` - `id`/`name`/`initials`/`telecom`/`patient_status`/`is_active_client` (see [Patient data](#patient-data) below)
-  - `invoice` - the linked invoice, if one's been raised, via Halaxy's direct appointment→invoice reference (more reliable than matching by date - see the notes in the code)
+  - `patient_id` - a bare Halaxy ID, nothing else (see [Patient data](#patient-data) below)
+  - `invoice` - the linked invoice, if one's been raised, via Halaxy's direct appointment→invoice reference (more reliable than matching by date - see the notes in the code), including `funding_type`
   - `awaiting_insurer_invoice` - populated only when there's no invoice yet *and* the patient has an active Coverage on file flagged "billed to an organisation" - i.e. flags a session that's expected to be billed to an insurer/employer but hasn't been yet
   - `referrals` - the patient's active Referral(s) (see `list_referrals` below), so their current session count is right there without a second call
 
@@ -19,8 +21,9 @@ This is a small, single-tenant tool built for one practice's own use, not a gene
   Meetings also carry `availability_hint` - a best-effort *guess* at whether the meeting is non-working/blocked time (a break, leave, etc.), matching keywords in `description` or a blank description. **This is not a real Halaxy field and not availability data** - `likely_non_working: true` must never be read as "free to book a client into". Confirmed against real calendar screenshots: Halaxy's own UI shows generic blocker titles (e.g. "BREAK") for meetings the API returns with a *completely blank* `description` - there's no field anywhere carrying that title, so keyword-matching alone would miss real blockers entirely; the blank-description signal is what actually catches them, at lower confidence.
 - **`list_practitioners()`** - clinical staff, each with their PractitionerRole ID and name, so a client can resolve "what's on for Alice today" to a role ID before matching it against `list_appointments`.
 - **`list_invoices_by_payer(payer_name)`** - every invoice ever billed to a specific insurer/employer/organisation (e.g. "Acme Insurance"), not tied to any date - searches Halaxy's `Invoice?recipient=` directly, so it doesn't have `list_invoices`'s lookback-window blind spot (see below).
-- **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (most commonly a Medicare Mental Health Treatment Plan - "6 sessions to start", as most people know it - but also DVA, WorkCover, etc). Each carries `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"` (used ≥ authorized), `"expiring_soon"` (ends within 30 days), `"expired"`. Optionally filter to just one flag - e.g. "who's about to run out of sessions".
-- **`find_patient(name)`** - searches for a patient/client by name (e.g. "Jane Citizen", or just "Citizen"), returning id/name/initials/telecom/patient_status/is_active_client for every match - the tool behind "what's \<client\>'s phone number" style questions. Confirmed live: Halaxy's `Patient` search supports a `name` parameter matching case-insensitively against both given and family name. Common surnames can genuinely match more than one real patient - deliberately returns every match rather than guessing, so a common name comes back as multiple results to disambiguate rather than silently picking one.
+- **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (most commonly a Medicare Mental Health Treatment Plan - "6 sessions to start", as most people know it - but also DVA, WorkCover, etc). Each carries a `patient_id`, `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"` (used ≥ authorized), `"expiring_soon"` (ends within 30 days), `"expired"`. Optionally filter to just one flag.
+
+There used to be a sixth tool, `find_patient(name)`, for "what's \<client\>'s phone number" style questions. It's been deliberately removed - see [Patient data](#patient-data) below for why.
 
 ## Required Halaxy API key scopes
 
@@ -31,9 +34,10 @@ Create an API key in Halaxy (Settings → API Keys) with whichever of these you 
 | Appointments → Retrieve | `list_appointments` |
 | Invoices & Payments → Retrieve, Retrieve Fees | `list_invoices`, `list_invoices_by_payer` |
 | Practitioners → Retrieve | `list_practitioners`, practitioner names in `list_appointments` |
-| Patients → Retrieve | Patient names/telecom/status in `list_appointments`, `find_patient` |
 | Claims & Referrals → Retrieve Claim | `awaiting_insurer_invoice`, `list_invoices_by_payer` (this is Halaxy's plain-English label for read access to the FHIR `Coverage` resource) |
 | Claims & Referrals → Retrieve Referral | `list_referrals`, `referrals` in `list_appointments` (read access to the FHIR `Referral` resource) |
+
+**`Patients → Retrieve` is deliberately left off** - this server never calls Halaxy's `Patient` endpoint at all (see [Patient data](#patient-data) below), so it doesn't need that scope enabled. Leaving it off is a real, Halaxy-side guarantee that no patient data beyond a bare ID could leave this server, not just a code-level one.
 
 Example of what this looks like in Halaxy's own API key scope screen:
 
@@ -41,7 +45,17 @@ Example of what this looks like in Halaxy's own API key scope screen:
 
 ## Patient data
 
-This server deliberately minimises what it exposes about a patient. Halaxy's `Patient` resource also carries DOB, address, gender, emergency contact, and referral-source notes - none of that is needed here, and it's enforced in code (`ALLOWED_PATIENT_FIELDS` in `halaxy_mcp.py`), not just by convention: every patient lookup is filtered down to `id`/`name`/`initials`/`telecom`/`patient_status`/`is_active_client` before it can reach the MCP client, regardless of what's asked for.
+This server never returns a patient's name, phone number, email, DOB, address, gender, or any other identifying field - only a bare, opaque `patient_id`, the same ID already carried on the appointment/invoice/referral resource itself. It doesn't even call Halaxy's `Patient` endpoint to look one up (see the scopes table above) - there's no Patient resource fetched, so there's nothing beyond an ID to leak.
+
+This is a deliberate privacy-law decision, not just "no DOB/address/gender": for a psychology practice, a client's *name* tied to a session is itself health information under Australia's Privacy Act, and health service providers don't get the small-business exemption other businesses can rely on regardless of size. Disclosing that to a third-party AI vendor's servers needs its own lawful basis - a legal/policy question for the practice running this, not something this server should quietly decide by exposing the data. Concretely, that means:
+
+- No tool returns a patient's name, phone, or email - ever, for any input.
+- No lookup-by-name tool exists (there used to be a `find_patient(name)`, removed for this reason).
+- No tool answers "who is this session/invoice/referral with" - only "what `patient_id`, and what non-identifying fact" (e.g. `funding_type`, `session_mode`, referral limits).
+- Invoice titles and session `description` fields - free text Halaxy lets staff put a client's name into - are withheld too, not just structured Patient fields. A patient-billed invoice's `payer_name` is `null` (Halaxy titles those with the patient's own name); an insurer/employer-billed invoice's `payer_name` is returned, since that name isn't patient data. `funding_type` (`"self"` vs. `"organisation"`) gives you the self-funded/insurer-funded distinction without a name either way.
+- Every tool's own docstring instructs the calling model on how to answer identity-style questions ("who is my 2pm with") - along the lines of "I can't tell you who that's with, but it's a self-funded F2F session" - rather than guessing. That's guidance for the model, not a substitute for the hard control above (there's simply no name in the data for it to relay).
+
+If a future need genuinely requires some identifying patient data, that's a decision to make deliberately (widening what's returned in `halaxy_mcp.py`, and re-enabling `Patients → Retrieve` on the API key) - not something that should happen by accident.
 
 **Clinical/session notes are not retrievable through this API at all, for any key or scope.** Halaxy's own `/metadata` capability statement shows its clinical-notes resource (`DocumentReference`) supports `create`/`patch` only - no read, matching what the Halaxy UI itself shows (Clinical Notes only has a Create toggle). This is a whole-API limitation, not something this server chooses not to expose.
 
@@ -219,7 +233,7 @@ Unlike Claude's "paste a URL and connect" custom connector, Microsoft 365 Copilo
 - **`list_invoices`'s lookback window can miss invoices.** Halaxy's `Invoice` search has no parameter for the invoice's own `date` field, only `created`/`_lastUpdated` - so `list_invoices` fetches invoices created in the last 45 days and filters client-side for an exact `date` match. Insurer/employer-billed invoices (e.g. workers' comp) are sometimes created months before the session they end up dated for, which can fall outside that window. `list_appointments` doesn't have this problem (it follows the appointment→invoice link directly), and `list_invoices_by_payer` doesn't either (it searches by recipient, unbounded by date) - prefer those when the date-based blind spot matters.
 - **`session` vs. `meeting` is inferred from whether the appointment has a linked `Patient` participant**, not from any explicit Halaxy field - a real session booked without linking a patient record in Halaxy would be miscategorised as a meeting.
 - No write operations (create/update anything) are implemented, on purpose.
-- The HTTP transport's OAuth authorization server is a minimal, self-contained implementation with one shared login (not per-person accounts) and in-memory state (tokens don't survive a restart) - see [Docker / HTTP transport](#docker--http-transport) above. Verified working against Claude's connector requirements specifically; other MCP clients may expect something different.
+- The HTTP transport's OAuth authorization server is a minimal, self-contained implementation with one shared login (not per-person accounts) - see [Docker / HTTP transport](#docker--http-transport) above. Verified working against Claude's connector requirements specifically; other MCP clients may expect something different.
 
 ## What it deliberately doesn't do
 
@@ -227,4 +241,4 @@ This wraps a handful of read-only endpoints matching one practice's own needs, n
 
 ## License
 
-GPLv3 - see [LICENSE](LICENSE).
+GPLv3 - see [LICENSE](LICENSE). See also [DISCLAIMER.md](DISCLAIMER.md) - no warranty, do your own research before deploying this with real patient data.

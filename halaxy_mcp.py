@@ -3,12 +3,17 @@
 Halaxy MCP server.
 
 Tools: list_invoices(date), list_appointments(date), list_practitioners(),
-list_invoices_by_payer(payer_name), list_referrals(flag), find_patient(name).
+list_invoices_by_payer(payer_name), list_referrals(flag).
 Talks to Halaxy using the OAuth
 client_credentials flow. Matches the permissions enabled on the
 "ClaudeMCPLimited" Halaxy API key (Appointments -> Retrieve, Invoices &
 Payments -> Retrieve / Retrieve Fees, Practitioners -> Retrieve,
-Patients -> Retrieve, Claims & Referrals -> Retrieve Claim).
+Claims & Referrals -> Retrieve Claim). "Patients -> Retrieve" is
+deliberately left OFF on the API key - this server never calls Halaxy's
+Patient endpoint at all (see below), so it doesn't need that scope
+enabled, and it's a real, easy-to-verify guarantee (in the Halaxy UI,
+not just in this code) that no patient data beyond a bare ID ever could
+leave this server, even in a future bug.
 
 "Retrieve Claim" is Halaxy's plain-English label for read access to the
 FHIR `Coverage` resource - a patient's health-fund/insurer/employer
@@ -23,17 +28,20 @@ letting a caller like `_fetch_all` silently read the missing "entry" key
 as zero results (which would otherwise look identical to "no invoices
 today" instead of "this API key can't see invoices at all").
 
-Patient data is deliberately minimised: Halaxy's Patient resource also
-carries DOB, address, gender, emergency contact, and referral-source
-notes, but none of that is needed here. Every Patient lookup is filtered
-through ALLOWED_PATIENT_FIELDS (id, name, initials, telecom,
-patient_status, is_active_client) in `_get_patient` - that filtering is
-enforced in code, not just by convention, so those fields can never reach
-Claude through this server regardless of what's asked for. There is no
-tool, and no plan to add one, that accepts a "which fields" parameter for
-Patient data - if asked for a patient's DOB/address/gender, the correct
-answer is that this server cannot provide it, not an attempt to fetch it
-some other way.
+Patient data leaving this server is deliberately reduced to a bare,
+non-identifying Halaxy ID (`patient_id`) - no name, phone, email, DOB,
+address, gender, patient status, or any other field Halaxy's Patient
+resource carries. This isn't only about DOB/address: for a psychology
+practice, a person's *name* tied to a session is itself health
+information under the Privacy Act (a person receiving psychological
+treatment) - so no tool here returns a patient's name, there is no
+`find_patient`-style lookup-by-name tool, and no tool answers "who is
+this session/invoice/referral with" - only "what patient_id, and what
+non-identifying facts (funding_type, session_mode, referral limits,
+etc)". Invoice titles and session descriptions - free text Halaxy lets
+staff put a client's name into - are scrubbed for the same reason (see
+`_invoice_payer_name` and `list_appointments`'s handling of session
+descriptions).
 
 Transport: stdio (default, for Claude Desktop's local subprocess model)
 or http (MCP_TRANSPORT=http - for Docker/the Raspberry Pi deployment,
@@ -539,6 +547,25 @@ def _fetch_invoices_created_since(since_date: str) -> list[dict]:
     return _fetch_all("Invoice", {"created": f"ge{since_date}"})
 
 
+def _invoice_payer_name(inv: dict) -> str | None:
+    """Invoice.title, unless it's identifying a patient - Halaxy titles patient-billed invoices with
+    the patient's own name, which is exactly what this server must never return (see module
+    docstring). Org-billed invoices (insurer/employer) are unaffected - that name isn't patient data.
+    """
+    if inv.get("recipient", {}).get("type") == "Patient":
+        return None
+    return inv.get("title")
+
+
+def _invoice_funding_type(inv: dict) -> str:
+    """Who's actually billed for this invoice, without naming them: "self" (the patient themselves)
+    or "organisation" (an insurer/employer, billed via a Coverage record - see
+    `_get_patient_insurer_coverage`). Lets a caller answer "is this session self-funded or
+    insurer-funded" without ever needing the payer's name.
+    """
+    return "organisation" if inv.get("recipient", {}).get("type") == "Organization" else "self"
+
+
 @mcp.tool()
 def list_invoices(date: str | None = None) -> str:
     """List Halaxy invoices dated a given day.
@@ -552,11 +579,17 @@ def list_invoices(date: str | None = None) -> str:
 
     Returns:
         JSON with the target date and the matching invoices (id, payer
-        name/patient details, status, and amounts), for Claude to read
-        and summarise. `patient` is only populated when the invoice's
-        recipient is an actual Patient (not an insurer/employer, e.g.
-        workers' comp invoices billed to a company) - `payer_name` (from
-        the invoice's own title) always covers that case either way.
+        name, patient_id, funding_type, and amounts), for Claude to read
+        and summarise. `patient_id` is only populated - as a bare Halaxy
+        ID, never a name (see module docstring) - when the invoice's
+        recipient is an actual Patient. `funding_type` is `"self"` when
+        the patient themselves is billed, `"organisation"` when an
+        insurer/employer is - this is the safe way to answer "is this
+        self-funded or insurer-funded" without a name. `payer_name` (from
+        the invoice's own title) is only returned when `funding_type` is
+        `"organisation"` - Halaxy titles patient-billed invoices with the
+        patient's own name, so that title is withheld for a "self"
+        invoice.
     """
     if date is None:
         date = datetime.now(PRACTICE_TIMEZONE).strftime("%Y-%m-%d")
@@ -568,9 +601,10 @@ def list_invoices(date: str | None = None) -> str:
     summary = [
         {
             "id": inv.get("id"),
-            "payer_name": inv.get("title"),
-            "patient": (
-                _get_patient(_ref_id(inv["recipient"]["reference"]))
+            "payer_name": _invoice_payer_name(inv),
+            "funding_type": _invoice_funding_type(inv),
+            "patient_id": (
+                _ref_id(inv["recipient"]["reference"])
                 if inv.get("recipient", {}).get("type") == "Patient"
                 else None
             ),
@@ -682,140 +716,15 @@ def list_practitioners() -> str:
     )
 
 
-def _initials(name_list: list[dict]) -> str | None:
-    """First-letter-of-given + first-letter-of-family initials, e.g. 'Ms Jane Citizen' -> 'JC'."""
-    name = _preferred_name(name_list)
-    if not name:
-        return None
-    given = name.get("given", [])
-    family = name.get("family", "")
-    letters = (given[0][0] if given else "") + (family[0] if family else "")
-    return letters.upper() or None
-
-
-PATIENT_STATUS_EXTENSION_URL = "https://terminology.halaxy.com/StructureDefinition/patient-status"
-
-# Halaxy's own docs (support.halaxy.com, "Set a patient status") define these:
-#   current   - actively active in the practice, selectable for appointments
-#   contact   - not yet a patient; a lead/contact record, not an active client
-#   archived  - inactive, but can still be selected for appointments
-#   blocked   - can no longer be selected for appointments
-#   deceased  - can no longer be selected for appointments
-# "current" is the only status that means an actual active client - the
-# plain FHIR `active` boolean is too coarse for this (it's also true for
-# "contact", which isn't a client at all yet).
-ACTIVE_CLIENT_STATUS = "current"
-
-# Hard allowlist of every field this server is permitted to return about a
-# patient - deliberately narrow. Halaxy's Patient resource also carries
-# DOB, address, gender, emergency contact, and referral-source notes; none
-# of that is needed here, and _patient_summary must never be extended to
-# include it. This set is enforced (not just documented) by
-# `_get_patient`, so accidentally adding a field to _patient_summary later
-# still gets stripped before it ever reaches Claude.
-ALLOWED_PATIENT_FIELDS = {"id", "name", "initials", "telecom", "patient_status", "is_active_client"}
-
-
-def _patient_summary(patient: dict) -> dict:
-    """Reduce a Patient resource to just the fields this server needs - see ALLOWED_PATIENT_FIELDS.
-
-    Deliberately drops everything else Halaxy returns on a Patient (DOB,
-    address, gender, emergency contact, referral-source notes, etc.) -
-    none of it is needed here, so it's discarded at this boundary rather
-    than passed through to Claude.
-    """
-    status = next(
-        (
-            ext.get("valueString")
-            for ext in patient.get("extension", [])
-            if ext.get("url") == PATIENT_STATUS_EXTENSION_URL
-        ),
-        None,
-    )
-    return {
-        "id": patient.get("id"),
-        "name": _human_name(patient.get("name", [])),
-        "initials": _initials(patient.get("name", [])),
-        "telecom": [
-            {"system": t.get("system"), "value": t.get("value"), "use": t.get("use")}
-            for t in patient.get("telecom", [])
-        ],
-        "patient_status": status,
-        "is_active_client": status == ACTIVE_CLIENT_STATUS,
-    }
-
-
-# Patient demographics change rarely enough, and are looked up by the same
-# handful of IDs across appointments/invoices in one call, that an
-# in-memory cache avoids re-fetching the same patient repeatedly.
-PATIENT_CACHE_TTL_SECONDS = 6 * 60 * 60
-_patient_cache: dict[str, dict] = {}
-
-
-def _allowlisted_patient_summary(patient: dict) -> dict:
-    """`_patient_summary` filtered through ALLOWED_PATIENT_FIELDS.
-
-    This is the one function every Patient-returning code path must go
-    through - it's what's actually trusted to never leak DOB/address/
-    gender/etc, even if `_patient_summary` is edited incorrectly later.
-    """
-    summary = {k: v for k, v in _patient_summary(patient).items() if k in ALLOWED_PATIENT_FIELDS}
-    assert set(summary) <= ALLOWED_PATIENT_FIELDS
-    return summary
-
-
-def _get_patient(patient_id: str) -> dict | None:
-    """Fetch (or reuse a cached) reduced patient summary - see `_allowlisted_patient_summary`."""
-    cached = _patient_cache.get(patient_id)
-    if cached is not None and time.time() < cached["expires_at"]:
-        return cached["summary"]
-
-    patient = _halaxy_get(f"Patient/{patient_id}", {})
-    if patient.get("resourceType") != "Patient":
-        return None
-
-    summary = _allowlisted_patient_summary(patient)
-    _patient_cache[patient_id] = {"summary": summary, "expires_at": time.time() + PATIENT_CACHE_TTL_SECONDS}
-    return summary
-
-
-@mcp.tool()
-def find_patient(name: str) -> str:
-    """Search for a patient/client by name - resolves a name to id/phone/email/etc.
-
-    Confirmed live: Halaxy's Patient search supports a `name` parameter
-    that matches case-insensitively against both given and family name,
-    substring-friendly (e.g. "swift" matches "Naomi Swift"). This is the
-    tool to use for "what's <client>'s phone number" style questions,
-    where you only have a name to start from.
-
-    Common names can genuinely match more than one patient (confirmed
-    live - e.g. two unrelated real patients both named "Swift") - this
-    deliberately returns every match rather than guessing which one was
-    meant, so use other context (recent appointments, DOB if the user
-    provides it, etc.) to disambiguate when there's more than one.
-
-    Args:
-        name: Full or partial name to search for, e.g. "Naomi Swift",
-            "Swift", or "Naomi".
-
-    Returns:
-        JSON list of matching patients - id/name/initials/telecom/
-        patient_status/is_active_client for each (same fields as
-        elsewhere in this server - see the module docstring for why
-        DOB/address/gender are never included). Empty list if no match.
-    """
-    if not name or not name.strip():
-        raise ValueError("name must not be empty")
-
-    patients = [_allowlisted_patient_summary(p) for p in _fetch_all("Patient", {"name": name.strip()})]
-
-    for summary in patients:
-        _patient_cache[summary["id"]] = {"summary": summary, "expires_at": time.time() + PATIENT_CACHE_TTL_SECONDS}
-
-    return json.dumps({"query": name, "match_count": len(patients), "patients": patients}, indent=2)
-
-
+# This server never calls Halaxy's Patient endpoint at all, and doesn't
+# need the "Patients -> Retrieve" scope on the API key - every place a
+# patient needs identifying is already carrying the patient's ID on the
+# resource being read (Appointment.participant, Invoice.recipient,
+# Referral.subject), and the ID is *all* this server ever surfaces (see
+# module docstring for why even a name is withheld). There is nothing
+# else to reduce/allowlist here, unlike the fields on a fetched Patient
+# resource - there's simply no Patient resource fetched in the first
+# place.
 APPOINTMENT_PARTICIPANT_STATUS_EXTENSION_URL = (
     "https://terminology.halaxy.com/StructureDefinition/appointment-participant-status"
 )
@@ -1188,10 +1097,23 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     field (which is inconsistent - sometimes a session counter like "3/8",
     sometimes a note like "Kelly to call Chris on ...", sometimes empty).
 
-    Practitioners and patients are both resolved via this API key's
-    "Practitioners" and "Patients" permissions. Patient data is
-    deliberately minimal - only name/initials/telecom, never DOB, address,
-    or anything else Halaxy holds on the patient.
+    Practitioners are resolved via this API key's "Practitioners"
+    permission. Patients are never looked up at all - `patient_id` is
+    just the bare Halaxy ID already carried on the appointment itself, no
+    Patient endpoint call involved, and no name/phone/email/DOB/anything
+    else about who that ID belongs to is ever returned (see module
+    docstring for why even a name is withheld). A session's own
+    `description` is withheld for the same reason (staff sometimes put a
+    client's name or a clinical note into it) - only meetings return one.
+
+    IMPORTANT for answering identity-style questions ("who is my 2pm
+    with", "who's <time>'s session"): this tool cannot tell you who a
+    session is with, on purpose, and no other tool in this server can
+    either. Answer using only what this tool actually returns - e.g. "I
+    can't tell you who that's with (patient identity isn't exposed
+    through this server), but it's a self-funded F2F session at 2pm" -
+    rather than guessing, inferring a name from context, or treating
+    `patient_id` as if it were identifying information to relay.
 
     Args:
         date: Date in YYYY-MM-DD format. Defaults to today (Australia/Sydney).
@@ -1203,6 +1125,14 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     appointment is booked against (Appointment.supportingInformation),
     not the description field. Meetings have no HealthcareService, so
     this is always null for them.
+
+    A session's linked `invoice` (see above) carries `funding_type` -
+    `"self"` if the patient themselves is billed, `"organisation"` if an
+    insurer/employer is - so "is this session self-funded or
+    insurer-funded" is answerable without a name. `payer_name` on that
+    invoice is only populated when `funding_type` is `"organisation"`
+    (Halaxy titles patient-billed invoices with the patient's own name,
+    so that's withheld for a "self" invoice).
 
     A session with no invoice yet also carries `awaiting_insurer_invoice`
     - populated (with the insurer/employer name) only when the patient
@@ -1241,10 +1171,11 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
 
     Returns:
         JSON with the target date, each appointment's type, time,
-        description, session mode, patient (id/name/initials/telecom, or
-        null for a meeting), practitioner name (and role ID), linked
-        invoice details (or null), awaiting_insurer_invoice, referrals,
-        and (meetings only) availability_hint - plus `cancelled_count`
+        description (meetings only - null for sessions), session mode,
+        patient_id (bare Halaxy ID, never a name, or null for a meeting),
+        practitioner name (and role ID), linked invoice details including
+        funding_type (or null), awaiting_insurer_invoice, referrals, and
+        (meetings only) availability_hint - plus `cancelled_count`
         (excluded from `appointments` itself).
     """
     if date is None:
@@ -1276,13 +1207,18 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
                 "appointment_type": this_type,
                 "start": appt.get("start"),
                 "end": appt.get("end"),
-                "description": appt.get("description"),
+                # Session descriptions are free text staff can (and do) put a
+                # client's name or clinical notes into - withheld for the same
+                # reason patient names are (see module docstring). Meetings
+                # never have a Patient participant, so their description
+                # isn't patient data and stays.
+                "description": appt.get("description") if this_type == "meeting" else None,
                 "session_mode": (
                     _get_healthcare_service_name(service_id)
                     if (service_id := _healthcare_service_id(appt))
                     else None
                 ),
-                "patient": _get_patient(refs["patient_id"]) if refs["patient_id"] else None,
+                "patient_id": refs["patient_id"],
                 "practitioner_role_id": refs["practitioner_role_id"],
                 "practitioner_name": practitioner_role_names.get(refs["practitioner_role_id"], {}).get("name"),
                 "invoice_id": refs["invoice_id"],
@@ -1299,7 +1235,8 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
         invoice = _halaxy_get(f"Invoice/{invoice_id}", {})
         if invoice.get("resourceType") == "Invoice":
             invoices_by_id[invoice_id] = {
-                "payer_name": invoice.get("title"),
+                "payer_name": _invoice_payer_name(invoice),
+                "funding_type": _invoice_funding_type(invoice),
                 "status": invoice.get("status"),
                 "date": invoice.get("date"),
                 "totalGross": invoice.get("totalGross", {}).get("value"),
@@ -1311,13 +1248,13 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
         invoice = invoices_by_id.get(item.pop("invoice_id"))
         item["invoice"] = invoice
         item["awaiting_insurer_invoice"] = (
-            _get_patient_insurer_coverage(item["patient"]["id"])
-            if invoice is None and item["appointment_type"] == "session" and item["patient"]
+            _get_patient_insurer_coverage(item["patient_id"])
+            if invoice is None and item["appointment_type"] == "session" and item["patient_id"]
             else None
         )
         item["referrals"] = (
-            _get_patient_active_referrals(item["patient"]["id"])
-            if item["appointment_type"] == "session" and item["patient"]
+            _get_patient_active_referrals(item["patient_id"])
+            if item["appointment_type"] == "session" and item["patient_id"]
             else []
         )
 
@@ -1406,19 +1343,21 @@ def list_referrals(flag: str | None = None) -> str:
       - "expiring_soon" - period ends within 30 days
       - "expired" - period has already ended
 
-    Use this for practice-wide sweeps ("who's about to run out of
-    sessions", "whose plan is expiring soon", "who's gone over their
-    referral cap and needs a new GP referral"). For a specific client's
-    current session count while looking at their appointments, see the
-    `referrals` field on `list_appointments`.
+    Use this for practice-wide sweeps ("how many referrals are about to
+    run out of sessions", "which referrals are expiring soon") - answer
+    with counts/lists keyed by `patient_id` and referral details, not a
+    patient's name (this server never returns one - see module
+    docstring). For a specific client's current session count while
+    looking at their appointments, see the `referrals` field on
+    `list_appointments`.
 
     Args:
         flag: Optionally filter to just one of "over_limit", "expiring_soon",
             or "expired". Omit to return every active referral.
 
     Returns:
-        JSON list of referrals, each with the patient (id/name/initials/
-        telecom), referral type, referring/referred-to practitioner,
+        JSON list of referrals, each with patient_id (a bare Halaxy ID,
+        never a name), referral type, referring/referred-to practitioner,
         period, sessions/dollars total vs. used vs. remaining, and flags.
     """
     if flag not in (None, "over_limit", "expiring_soon", "expired"):
@@ -1432,8 +1371,7 @@ def list_referrals(flag: str | None = None) -> str:
         summary = _referral_summary(referral, practitioner_role_names)
         if flag and flag not in summary["flags"]:
             continue
-        patient_id = _ref_id(referral.get("subject", {}).get("reference"))
-        summary["patient"] = _get_patient(patient_id) if patient_id else None
+        summary["patient_id"] = _ref_id(referral.get("subject", {}).get("reference"))
         referrals.append(summary)
 
     referrals.sort(key=lambda r: r["period_end"] or "")
