@@ -191,6 +191,28 @@ docker compose -f docker-compose.pi.yml up -d --build
 
 You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of the login gate, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges (these change over time, so check the current values rather than hardcoding them).
 
+## Confirmed working with
+
+- **Claude** (custom connector) - the full OAuth flow (register → login page → connect) has been verified end-to-end against a real deployment, not just locally.
+- **GitHub Copilot** (VS Code, Visual Studio, Copilot CLI) - the stdio path (above) is verified; the HTTP/OAuth path hasn't specifically been tried with it, but there's no reason to expect it wouldn't work the same way, since it's the same standard OAuth 2.1 + Dynamic Client Registration flow Claude and ChatGPT use.
+- **Microsoft 365 Copilot** (via a Copilot Studio agent with an MCP tool) - confirmed working. See [Setting this up in Microsoft 365 Copilot](#setting-this-up-in-microsoft-365-copilot) below - it's not the same "paste a URL" flow as Claude.
+- **ChatGPT** - confirmed working, unmodified. Good evidence this server's plain OAuth 2.1 + Dynamic Client Registration implementation is portable across MCP clients generally, not tuned to one client's specific behaviour.
+
+### Setting this up in Microsoft 365 Copilot
+
+Unlike Claude's "paste a URL and connect" custom connector, Microsoft 365 Copilot doesn't let you add a private server directly to its own connector gallery - that gallery (called "federated connectors") requires Microsoft's review/approval to list a server there at all, which isn't viable for a private/self-hosted tool. The actual self-service path is **Copilot Studio** - a separate product used to build a small "agent" that's then published into Teams/Microsoft 365 Copilot:
+
+1. In Copilot Studio, create an **Agent** (not "Workflow" - that's for automated multi-step processes, not tool-calling).
+2. On the agent's **Tools** page: **Add a tool** → **New tool** → **Model Context Protocol**.
+3. **Server URL**: `https://your-domain.example.com/mcp`. **Authentication type**: OAuth 2.0.
+4. Try **"Dynamic discovery"** first - it's built for exactly what this server supports (Dynamic Client Registration). If it fails (this server exposes the older `/.well-known/oauth-authorization-server` discovery style, which satisfied Claude and ChatGPT, but not the newer RFC 9728 `/.well-known/oauth-protected-resource` metadata some clients look for first), fall back to the **"Dynamic"** option and fill in manually:
+   - **Authorization URL**: `https://your-domain.example.com/authorize`
+   - **Token URL template**: `https://your-domain.example.com/token`
+5. Write **Instructions** for the agent describing what it can help with and its real limits - it's worth being explicit, since the agent won't otherwise know what the underlying tools can't do.
+6. **Publish**, selecting **Teams + Microsoft 365** as the channel.
+
+**Licensing, worth knowing before you start**: building an agent in Copilot Studio needs *some* Copilot Studio access (a trial license lets you build and test in the builder's own preview panel, but can't publish). *Using* a published agent through Microsoft 365 Copilot Chat/Teams needs a real (paid, not free "Basic") Microsoft 365 Copilot license for each user - per Microsoft's own billing docs, agent actions (which includes calling an MCP tool) are "No charge" against that license for real end-use, so once real licenses are assigned, ongoing usage for a small team shouldn't need a separate Copilot Studio credit purchase or Azure pay-as-you-go setup. If a newly-assigned license doesn't seem to take effect immediately, try a full sign-out/sign-in before assuming something's actually wrong - license propagation can lag behind the assignment itself.
+
 ## Known limitations, worth knowing about
 
 - **`list_invoices`'s lookback window can miss invoices.** Halaxy's `Invoice` search has no parameter for the invoice's own `date` field, only `created`/`_lastUpdated` - so `list_invoices` fetches invoices created in the last 45 days and filters client-side for an exact `date` match. Insurer/employer-billed invoices (e.g. workers' comp) are sometimes created months before the session they end up dated for, which can fall outside that window. `list_appointments` doesn't have this problem (it follows the appointment→invoice link directly), and `list_invoices_by_payer` doesn't either (it searches by recipient, unbounded by date) - prefer those when the date-based blind spot matters.
