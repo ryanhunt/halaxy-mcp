@@ -159,8 +159,20 @@ This builds **directly on the target device** - no cross-compilation needed. Doc
 # check what you're running, if unsure:
 uname -m   # armv7l = 32-bit, aarch64 = 64-bit
 
-# install Docker if it isn't already:
-curl -fsSL https://get.docker.com | sh
+# install Docker via its official apt repo (not the get.docker.com script -
+# Docker's own docs say that's not recommended for anything you'll keep
+# running). Covers armhf as well as arm64/amd64:
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 sudo usermod -aG docker $USER   # log out/in afterwards
 
 git clone https://github.com/ryanhunt/halaxy-mcp.git
