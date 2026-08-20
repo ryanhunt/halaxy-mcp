@@ -20,6 +20,7 @@ This is a small, single-tenant tool built for one practice's own use, not a gene
 - **`list_practitioners()`** - clinical staff, each with their PractitionerRole ID and name, so a client can resolve "what's on for Alice today" to a role ID before matching it against `list_appointments`.
 - **`list_invoices_by_payer(payer_name)`** - every invoice ever billed to a specific insurer/employer/organisation (e.g. "Acme Insurance"), not tied to any date - searches Halaxy's `Invoice?recipient=` directly, so it doesn't have `list_invoices`'s lookback-window blind spot (see below).
 - **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (most commonly a Medicare Mental Health Treatment Plan - "6 sessions to start", as most people know it - but also DVA, WorkCover, etc). Each carries `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"` (used ≥ authorized), `"expiring_soon"` (ends within 30 days), `"expired"`. Optionally filter to just one flag - e.g. "who's about to run out of sessions".
+- **`find_patient(name)`** - searches for a patient/client by name (e.g. "Jane Citizen", or just "Citizen"), returning id/name/initials/telecom/patient_status/is_active_client for every match - the tool behind "what's \<client\>'s phone number" style questions. Confirmed live: Halaxy's `Patient` search supports a `name` parameter matching case-insensitively against both given and family name. Common surnames can genuinely match more than one real patient - deliberately returns every match rather than guessing, so a common name comes back as multiple results to disambiguate rather than silently picking one.
 
 ## Required Halaxy API key scopes
 
@@ -30,7 +31,7 @@ Create an API key in Halaxy (Settings → API Keys) with whichever of these you 
 | Appointments → Retrieve | `list_appointments` |
 | Invoices & Payments → Retrieve, Retrieve Fees | `list_invoices`, `list_invoices_by_payer` |
 | Practitioners → Retrieve | `list_practitioners`, practitioner names in `list_appointments` |
-| Patients → Retrieve | Patient names/telecom/status in `list_appointments` |
+| Patients → Retrieve | Patient names/telecom/status in `list_appointments`, `find_patient` |
 | Claims & Referrals → Retrieve Claim | `awaiting_insurer_invoice`, `list_invoices_by_payer` (this is Halaxy's plain-English label for read access to the FHIR `Coverage` resource) |
 | Claims & Referrals → Retrieve Referral | `list_referrals`, `referrals` in `list_appointments` (read access to the FHIR `Referral` resource) |
 

@@ -3,7 +3,8 @@
 Halaxy MCP server.
 
 Tools: list_invoices(date), list_appointments(date), list_practitioners(),
-list_invoices_by_payer(payer_name). Talks to Halaxy using the OAuth
+list_invoices_by_payer(payer_name), list_referrals(flag), find_patient(name).
+Talks to Halaxy using the OAuth
 client_credentials flow. Matches the permissions enabled on the
 "ClaudeMCPLimited" Halaxy API key (Appointments -> Retrieve, Invoices &
 Payments -> Retrieve / Retrieve Fees, Practitioners -> Retrieve,
@@ -677,14 +678,20 @@ PATIENT_CACHE_TTL_SECONDS = 6 * 60 * 60
 _patient_cache: dict[str, dict] = {}
 
 
-def _get_patient(patient_id: str) -> dict | None:
-    """Fetch (or reuse a cached) reduced patient summary - see `_patient_summary`.
+def _allowlisted_patient_summary(patient: dict) -> dict:
+    """`_patient_summary` filtered through ALLOWED_PATIENT_FIELDS.
 
-    Every return path goes through the ALLOWED_PATIENT_FIELDS allowlist
-    here, not just through `_patient_summary` - so this is the one place
-    that has to be trusted to never leak DOB/address/gender/etc, even if
-    `_patient_summary` is edited incorrectly later.
+    This is the one function every Patient-returning code path must go
+    through - it's what's actually trusted to never leak DOB/address/
+    gender/etc, even if `_patient_summary` is edited incorrectly later.
     """
+    summary = {k: v for k, v in _patient_summary(patient).items() if k in ALLOWED_PATIENT_FIELDS}
+    assert set(summary) <= ALLOWED_PATIENT_FIELDS
+    return summary
+
+
+def _get_patient(patient_id: str) -> dict | None:
+    """Fetch (or reuse a cached) reduced patient summary - see `_allowlisted_patient_summary`."""
     cached = _patient_cache.get(patient_id)
     if cached is not None and time.time() < cached["expires_at"]:
         return cached["summary"]
@@ -693,10 +700,46 @@ def _get_patient(patient_id: str) -> dict | None:
     if patient.get("resourceType") != "Patient":
         return None
 
-    summary = {k: v for k, v in _patient_summary(patient).items() if k in ALLOWED_PATIENT_FIELDS}
-    assert set(summary) <= ALLOWED_PATIENT_FIELDS
+    summary = _allowlisted_patient_summary(patient)
     _patient_cache[patient_id] = {"summary": summary, "expires_at": time.time() + PATIENT_CACHE_TTL_SECONDS}
     return summary
+
+
+@mcp.tool()
+def find_patient(name: str) -> str:
+    """Search for a patient/client by name - resolves a name to id/phone/email/etc.
+
+    Confirmed live: Halaxy's Patient search supports a `name` parameter
+    that matches case-insensitively against both given and family name,
+    substring-friendly (e.g. "citizen" matches "Jane Citizen"). This is the
+    tool to use for "what's <client>'s phone number" style questions,
+    where you only have a name to start from.
+
+    Common names can genuinely match more than one patient (confirmed
+    live - e.g. two unrelated real patients both named "Swift") - this
+    deliberately returns every match rather than guessing which one was
+    meant, so use other context (recent appointments, DOB if the user
+    provides it, etc.) to disambiguate when there's more than one.
+
+    Args:
+        name: Full or partial name to search for, e.g. "Jane Citizen",
+            "Citizen", or "Jane".
+
+    Returns:
+        JSON list of matching patients - id/name/initials/telecom/
+        patient_status/is_active_client for each (same fields as
+        elsewhere in this server - see the module docstring for why
+        DOB/address/gender are never included). Empty list if no match.
+    """
+    if not name or not name.strip():
+        raise ValueError("name must not be empty")
+
+    patients = [_allowlisted_patient_summary(p) for p in _fetch_all("Patient", {"name": name.strip()})]
+
+    for summary in patients:
+        _patient_cache[summary["id"]] = {"summary": summary, "expires_at": time.time() + PATIENT_CACHE_TTL_SECONDS}
+
+    return json.dumps({"query": name, "match_count": len(patients), "patients": patients}, indent=2)
 
 
 APPOINTMENT_PARTICIPANT_STATUS_EXTENSION_URL = (
@@ -1001,7 +1044,7 @@ def _get_patient_active_referrals(patient_id: str) -> list[dict]:
 # Keywords someone might type into a meeting's description to mark it as
 # blocked/non-working time. NOT exhaustive, and NOT how Halaxy's own
 # calendar actually labels these in practice - confirmed live, real
-# examples of Halaxy's UI showing "BREAK" and "Staff leaves at 5pm" both
+# examples of Halaxy's UI showing "BREAK" and "Nat Leaves at 5pm" both
 # came back from the API with a completely blank description. So this
 # keyword match will rarely fire on its own; see `_meeting_availability_hint`.
 NON_WORKING_MEETING_KEYWORDS = (
@@ -1023,7 +1066,7 @@ def _meeting_availability_hint(description: str | None) -> dict:
     This is not backed by any Halaxy data at all - it's pattern-matching
     on free text, offered as a hint for the MCP client, not a claim about
     actual availability. Confirmed live: Halaxy's calendar UI displays
-    generic-looking blocker titles ("BREAK", "Staff leaves at 5pm") for
+    generic-looking blocker titles ("BREAK", "Nat Leaves at 5pm") for
     meetings whose `description` the API returns as completely blank -
     there's no Halaxy field anywhere that names or categorises a meeting
     (see the API investigation notes). So a blank description is weak but
@@ -1117,7 +1160,7 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     NOT a real Halaxy field and NOT availability data - `likely_non_working:
     true` must never be read as "this time is free to book a client
     into". Halaxy's own calendar shows generic blocker titles ("BREAK",
-    "Staff leaves at 5pm") for meetings the API returns with a completely
+    "Nat Leaves at 5pm") for meetings the API returns with a completely
     blank description - confirmed live - so there's no reliable way to
     detect these from this API at all; this is just the closest
     approximation available, offered as a hint.
