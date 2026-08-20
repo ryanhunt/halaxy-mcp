@@ -153,12 +153,27 @@ An MCP client does the rest automatically (register → authorize → login → 
 
 **Deploy it somewhere internet-facing** (e.g. a Raspberry Pi behind your own router): use `docker-compose.pi.yml` instead, which adds [Caddy](https://caddyserver.com/) in front for TLS (Let's Encrypt, auto-issued/renewed) and doesn't publish the app's port directly - only Caddy is reachable from outside the container network.
 
+This builds **directly on the target device** - no cross-compilation needed. Docker just produces whatever architecture image matches the device's own CPU, automatically. Verified working on both 64-bit (`arm64`/`aarch64` - a Pi 3B+ and up) and 32-bit (`armv7`/`armhf` - a Pi 2, or a Pi 3/4 on 32-bit Raspberry Pi OS) by actually building and running the image under QEMU emulation for both, not just assuming it'd work.
+
 ```bash
-cp Caddyfile.example Caddyfile   # edit in your real domain/DDNS hostname
-# In .env: set MCP_PUBLIC_URL to that same https://your-domain - it must
-# match what clients actually connect to.
+# check what you're running, if unsure:
+uname -m   # armv7l = 32-bit, aarch64 = 64-bit
+
+# install Docker if it isn't already:
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER   # log out/in afterwards
+
+git clone https://github.com/ryanhunt/halaxy-mcp.git
+cd halaxy-mcp
+cp .env.example .env && nano .env   # Halaxy credentials, MCP_LOGIN_USERNAME/PASSWORD, MCP_PUBLIC_URL
+cp Caddyfile.example Caddyfile && nano Caddyfile   # your real domain/DDNS hostname
+
 docker compose -f docker-compose.pi.yml up -d --build
 ```
+
+`MCP_PUBLIC_URL` (in `.env`) must be the real `https://your-domain` clients will connect to - it's used as the OAuth issuer/redirect base and has to match exactly. `docker compose -f docker-compose.pi.yml ps`/`logs -f` to check it's up; `restart: unless-stopped` means it survives a reboot as long as Docker itself starts on boot (the install script above enables that by default). To update later: `git pull && docker compose -f docker-compose.pi.yml up -d --build`.
+
+**Building for 32-bit ARM (`armv7`) needs a bit more than `pip install`, already handled in the Dockerfile**: `cryptography` (pulled in for the OAuth code) has prebuilt wheels for 64-bit platforms but not `armv7` - there it compiles a small piece (`cffi`) from source, which needs a C compiler and libc's headers. The Dockerfile installs `gcc`/`libc6-dev`/`libffi-dev` before `pip install` and removes them again afterwards to keep the image small - worth knowing if you ever modify the Dockerfile yourself, since `libc6-dev` in particular is easy to leave out by mistake (it's only a "Recommends" of `gcc` on Debian, not a hard dependency, so `--no-install-recommends` silently drops it and the build fails with a `stdlib.h: No such file or directory` error).
 
 You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of the login gate, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges (these change over time, so check the current values rather than hardcoding them).
 

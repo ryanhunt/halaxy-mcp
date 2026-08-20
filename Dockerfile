@@ -2,8 +2,24 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# gcc + libc6-dev + libffi-dev: cryptography (pulled in by pyjwt[crypto],
+# for the OAuth token machinery) ships prebuilt wheels for amd64/arm64,
+# but not for 32-bit ARM (armv7 - e.g. a Raspberry Pi 2, or a Pi 3
+# running 32-bit Raspberry Pi OS) - there it falls back to building cffi
+# from source, which needs a C compiler and libc's headers. Confirmed
+# live: --no-install-recommends drops libc6-dev too (it's only a
+# "Recommends" of gcc on Debian, not a hard dependency) and the build
+# fails with "fatal error: stdlib.h: No such file or directory" without
+# it - so it's listed explicitly here rather than relying on gcc to pull
+# it in. Removed again after pip install to keep the image lean - only
+# needed to build the wheel, not to run it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y --auto-remove gcc libc6-dev libffi-dev
 
 COPY halaxy_mcp.py .
 
