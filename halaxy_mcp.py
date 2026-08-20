@@ -466,6 +466,41 @@ def _get_patient(patient_id: str) -> dict | None:
     return summary
 
 
+APPOINTMENT_PARTICIPANT_STATUS_EXTENSION_URL = (
+    "https://terminology.halaxy.com/StructureDefinition/appointment-participant-status"
+)
+CANCELLED_PARTICIPANT_STATUS = "cancelled"
+
+
+def _is_appointment_cancelled(appointment: dict) -> bool:
+    """Whether Halaxy has this appointment marked as cancelled.
+
+    Confirmed live (this was a real bug - a cancelled session was showing
+    up as a normal upcoming appointment): the top-level `cancellationReason`
+    field is NOT a reliable signal by itself - many real cancelled
+    appointments don't have it set. The authoritative signal is the
+    Patient participant's "appointment-participant-status" modifierExtension
+    (not `extension` - Halaxy puts this one under modifierExtension) being
+    "cancelled". Checking both, since `cancellationReason` can still appear
+    on appointments the participant-status extension doesn't cover (no
+    Patient participant at all, e.g. a cancelled meeting/blocker).
+    """
+    if appointment.get("cancellationReason"):
+        return True
+
+    for participant in appointment.get("participant", []):
+        if participant.get("actor", {}).get("type") != "Patient":
+            continue
+        for ext in participant.get("modifierExtension", []):
+            if (
+                ext.get("url") == APPOINTMENT_PARTICIPANT_STATUS_EXTENSION_URL
+                and ext.get("valueCoding", {}).get("code") == CANCELLED_PARTICIPANT_STATUS
+            ):
+                return True
+
+    return False
+
+
 def _appointment_participant_refs(appointment: dict) -> dict:
     """Pull the patient ID, practitioner-role ID, and (if billed) linked invoice ID off an Appointment."""
     patient_id = None
@@ -780,11 +815,20 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     empty list means no active referral on file, not necessarily that
     they're self-referred (some funding types don't use Referral at all).
 
+    Cancelled appointments are excluded entirely (not counted, not
+    returned) - confirmed live this was previously a real bug: Halaxy's
+    `Appointment?date=eq...` search includes cancelled appointments by
+    default, with no indication in the fields this server used to look at
+    that they'd been cancelled, so one showed up looking like a completely
+    normal upcoming session. `cancelled_count` reports how many were
+    excluded, so the exclusion is visible rather than silent.
+
     Returns:
-        JSON with the target date and each appointment's type, time,
+        JSON with the target date, each appointment's type, time,
         description, session mode, patient (id/name/initials/telecom, or
         null for a meeting), practitioner name (and role ID), linked
-        invoice details (or null), awaiting_insurer_invoice, and referrals.
+        invoice details (or null), awaiting_insurer_invoice, and referrals
+        - plus `cancelled_count` (excluded from `appointments` itself).
     """
     if date is None:
         date = datetime.now(PRACTICE_TIMEZONE).strftime("%Y-%m-%d")
@@ -792,11 +836,13 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
         raise ValueError('appointment_type must be "session", "meeting", or omitted')
 
     data = _halaxy_get("Appointment", {"date": f"eq{date}", "_count": 100})
-    appointments = [
+    all_appointments = [
         entry["resource"]
         for entry in data.get("entry", [])
         if entry.get("resource", {}).get("resourceType") == "Appointment"
     ]
+    appointments = [a for a in all_appointments if not _is_appointment_cancelled(a)]
+    cancelled_count = len(all_appointments) - len(appointments)
 
     practitioner_role_names = _get_practitioner_role_names()
 
@@ -856,7 +902,12 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
         )
 
     return json.dumps(
-        {"queried_date": date, "appointment_count": len(parsed), "appointments": parsed},
+        {
+            "queried_date": date,
+            "appointment_count": len(parsed),
+            "cancelled_count": cancelled_count,
+            "appointments": parsed,
+        },
         indent=2,
     )
 
