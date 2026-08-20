@@ -998,6 +998,61 @@ def _get_patient_active_referrals(patient_id: str) -> list[dict]:
     return referrals
 
 
+# Keywords someone might type into a meeting's description to mark it as
+# blocked/non-working time. NOT exhaustive, and NOT how Halaxy's own
+# calendar actually labels these in practice - confirmed live, real
+# examples of Halaxy's UI showing "BREAK" and "Staff leaves at 5pm" both
+# came back from the API with a completely blank description. So this
+# keyword match will rarely fire on its own; see `_meeting_availability_hint`.
+NON_WORKING_MEETING_KEYWORDS = (
+    "BREAK",
+    "BLOCK",
+    "BLOCKED",
+    "LUNCH",
+    "HOLIDAY",
+    "LEAVE",
+    "OOO",
+    "OUT OF OFFICE",
+    "UNAVAILABLE",
+)
+
+
+def _meeting_availability_hint(description: str | None) -> dict:
+    """Best-effort GUESS at whether a meeting is a non-working-time blocker - not a real Halaxy field.
+
+    This is not backed by any Halaxy data at all - it's pattern-matching
+    on free text, offered as a hint for the MCP client, not a claim about
+    actual availability. Confirmed live: Halaxy's calendar UI displays
+    generic-looking blocker titles ("BREAK", "Staff leaves at 5pm") for
+    meetings whose `description` the API returns as completely blank -
+    there's no Halaxy field anywhere that names or categorises a meeting
+    (see the API investigation notes). So a blank description is weak but
+    real evidence (it's what Halaxy's own known blockers look like via
+    this API); an explicit keyword match is slightly stronger evidence,
+    for the rarer case where staff typed something recognisable.
+
+    IMPORTANT: `likely_non_working: True` does NOT mean the time is free
+    to book a client into. This server has no access to real Halaxy
+    availability data (the Schedule/Slot resources, which model that,
+    aren't used here) - it only means "this meeting looks like it might
+    not represent real client-facing work", nothing more.
+    """
+    text = (description or "").strip()
+    if not text:
+        return {
+            "likely_non_working": True,
+            "confidence": "low",
+            "reason": "blank description - matches the pattern seen for known blockers, but not conclusive",
+        }
+    if any(keyword in text.upper() for keyword in NON_WORKING_MEETING_KEYWORDS):
+        return {
+            "likely_non_working": True,
+            "confidence": "medium",
+            "reason": "description contains a blocker-like keyword (e.g. \"break\", \"block\", \"leave\")",
+        }
+    return {"likely_non_working": False, "confidence": None, "reason": None}
+
+
 @mcp.tool()
 def list_appointments(date: str | None = None, appointment_type: str | None = None) -> str:
     """List appointments for a given day, each tagged as a client "session" or a "meeting".
@@ -1056,12 +1111,24 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     normal upcoming session. `cancelled_count` reports how many were
     excluded, so the exclusion is visible rather than silent.
 
+    Meetings also carry `availability_hint` - a best-effort GUESS at
+    whether the meeting represents non-working/blocked time (e.g. a
+    break), based on pattern-matching the `description` text. This is
+    NOT a real Halaxy field and NOT availability data - `likely_non_working:
+    true` must never be read as "this time is free to book a client
+    into". Halaxy's own calendar shows generic blocker titles ("BREAK",
+    "Staff leaves at 5pm") for meetings the API returns with a completely
+    blank description - confirmed live - so there's no reliable way to
+    detect these from this API at all; this is just the closest
+    approximation available, offered as a hint.
+
     Returns:
         JSON with the target date, each appointment's type, time,
         description, session mode, patient (id/name/initials/telecom, or
         null for a meeting), practitioner name (and role ID), linked
-        invoice details (or null), awaiting_insurer_invoice, and referrals
-        - plus `cancelled_count` (excluded from `appointments` itself).
+        invoice details (or null), awaiting_insurer_invoice, referrals,
+        and (meetings only) availability_hint - plus `cancelled_count`
+        (excluded from `appointments` itself).
     """
     if date is None:
         date = datetime.now(PRACTICE_TIMEZONE).strftime("%Y-%m-%d")
@@ -1102,6 +1169,9 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
                 "practitioner_role_id": refs["practitioner_role_id"],
                 "practitioner_name": practitioner_role_names.get(refs["practitioner_role_id"], {}).get("name"),
                 "invoice_id": refs["invoice_id"],
+                "availability_hint": (
+                    _meeting_availability_hint(appt.get("description")) if this_type == "meeting" else None
+                ),
             }
         )
         if refs["invoice_id"]:
