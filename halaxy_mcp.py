@@ -101,6 +101,17 @@ MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", f"http://{MCP_HOST}:{MCP_PORT}
 MCP_LOGIN_USERNAME = os.environ.get("MCP_LOGIN_USERNAME")
 MCP_LOGIN_PASSWORD = os.environ.get("MCP_LOGIN_PASSWORD")
 
+# Where registered OAuth clients + issued access tokens are persisted, so
+# a docker-compose restart/rebuild (which happens on every code update)
+# doesn't silently invalidate every connected client's session - confirmed
+# live this was a real, recurring problem before this existed. In Docker
+# this should point at a path backed by a volume (docker-compose.pi.yml
+# mounts one at /data), so it survives `docker compose up --build`, not
+# just a plain container restart.
+MCP_OAUTH_STATE_FILE = os.environ.get(
+    "MCP_OAUTH_STATE_FILE", str(Path(__file__).resolve().parent / "oauth_state.json")
+)
+
 PRACTICE_TIMEZONE = ZoneInfo("Australia/Sydney")
 
 # Simple in-memory token cache. Halaxy access tokens are valid for
@@ -216,9 +227,21 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
     OAuth flow with Dynamic Client Registration - there's no field to
     paste a static token into at all.
 
-    Deliberately in-memory (registered clients, authorization codes, and
-    access tokens are all lost on a restart, forcing reconnect) -
-    acceptable for a small internal tool with no real user database.
+    Persisted to a small JSON file (MCP_OAUTH_STATE_FILE) so a
+    docker-compose restart/rebuild - which happens every time this code
+    is updated - doesn't invalidate every connected client's session,
+    forcing Claude/Copilot/ChatGPT to all reconnect. Confirmed live this
+    was a real, recurring problem before persistence was added: a Pi
+    redeploy silently wiped every registered client and access token,
+    and the next tool call from an already-connected client came back
+    as an opaque "permission required" error with no obvious cause.
+    `state_mapping` (mid-flow authorize state, not yet a real client/
+    token) is deliberately NOT persisted - it's only relevant for the
+    seconds between hitting /authorize and completing /login, so a
+    restart in that exact window just means retrying the connection,
+    which is an acceptable edge case in exchange for not persisting
+    throwaway state forever.
+
     "Signing in" is one shared username/password (MCP_LOGIN_USERNAME/
     PASSWORD) gating a plain login page, not a per-person identity system
     - reasonable for a two-person practice; swapping the single
@@ -232,6 +255,52 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.tokens: dict[str, AccessToken] = {}
         self.state_mapping: dict[str, dict[str, str | None]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Restore clients/codes/tokens from disk, if a state file exists - dropping anything already expired."""
+        path = Path(MCP_OAUTH_STATE_FILE)
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+
+        now = time.time()
+        self.clients = {
+            client_id: OAuthClientInformationFull.model_validate(c)
+            for client_id, c in data.get("clients", {}).items()
+        }
+        self.auth_codes = {
+            code: AuthorizationCode.model_validate(c)
+            for code, c in data.get("auth_codes", {}).items()
+            if c["expires_at"] > now
+        }
+        self.tokens = {
+            token: AccessToken.model_validate(t)
+            for token, t in data.get("tokens", {}).items()
+            if not t["expires_at"] or t["expires_at"] > now
+        }
+
+    def _save(self) -> None:
+        """Write clients/codes/tokens to disk - called after every mutation, not just on shutdown.
+
+        This file holds live access tokens - as sensitive as any bearer
+        credential - so it's written with 0600 permissions, and via a
+        temp-file-then-rename (atomic on POSIX) so a crash mid-write
+        can never leave a half-written, corrupt state file behind.
+        """
+        path = Path(MCP_OAUTH_STATE_FILE)
+        data = {
+            "clients": {client_id: c.model_dump(mode="json") for client_id, c in self.clients.items()},
+            "auth_codes": {code: c.model_dump(mode="json") for code, c in self.auth_codes.items()},
+            "tokens": {token: t.model_dump(mode="json") for token, t in self.tokens.items()},
+        }
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data))
+        tmp_path.chmod(0o600)
+        tmp_path.replace(path)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self.clients.get(client_id)
@@ -240,6 +309,7 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
         if not client_info.client_id:
             raise ValueError("No client_id provided")
         self.clients[client_info.client_id] = client_info
+        self._save()
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         """Called as part of Claude's /authorize request - send it on to our own login page."""
@@ -276,6 +346,7 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
             subject=authorization_code.subject,
         )
         del self.auth_codes[authorization_code.code]
+        self._save()
 
         return OAuthToken(
             access_token=token,
@@ -290,6 +361,7 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
             return None
         if access_token.expires_at and access_token.expires_at < time.time():
             del self.tokens[token]
+            self._save()
             return None
         return access_token
 
@@ -304,6 +376,7 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         if token.token in self.tokens:
             del self.tokens[token.token]
+            self._save()
 
     def login_page_html(self, state: str) -> str:
         return f"""
@@ -374,6 +447,7 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
             subject=username,
         )
         del self.state_mapping[state]
+        self._save()
 
         return RedirectResponse(url=construct_redirect_uri(redirect_uri, code=new_code, state=state), status_code=302)
 
@@ -711,7 +785,7 @@ def find_patient(name: str) -> str:
 
     Confirmed live: Halaxy's Patient search supports a `name` parameter
     that matches case-insensitively against both given and family name,
-    substring-friendly (e.g. "citizen" matches "Jane Citizen"). This is the
+    substring-friendly (e.g. "swift" matches "Naomi Swift"). This is the
     tool to use for "what's <client>'s phone number" style questions,
     where you only have a name to start from.
 
@@ -722,8 +796,8 @@ def find_patient(name: str) -> str:
     provides it, etc.) to disambiguate when there's more than one.
 
     Args:
-        name: Full or partial name to search for, e.g. "Jane Citizen",
-            "Citizen", or "Jane".
+        name: Full or partial name to search for, e.g. "Naomi Swift",
+            "Swift", or "Naomi".
 
     Returns:
         JSON list of matching patients - id/name/initials/telecom/

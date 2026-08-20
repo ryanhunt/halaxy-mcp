@@ -11,6 +11,13 @@ services:
     env_file: .env
     expose:
       - "8000"
+    volumes:
+      # Persists registered OAuth clients + access tokens across
+      # `docker compose up --build` (i.e. every code update) - without
+      # this, every connected client (Claude, Copilot, ChatGPT) has to
+      # reconnect after every redeploy, since the in-memory OAuth state
+      # would otherwise be wiped on every restart.
+      - oauth_state:/data
     restart: unless-stopped
 
   caddy:
@@ -29,3 +36,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  oauth_state:

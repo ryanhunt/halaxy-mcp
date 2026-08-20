@@ -23,18 +23,28 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY halaxy_mcp.py .
 
-RUN useradd --create-home --uid 1000 halaxy && chown -R halaxy:halaxy /app
+RUN useradd --create-home --uid 1000 halaxy \
+    && chown -R halaxy:halaxy /app \
+    && mkdir -p /data \
+    && chown halaxy:halaxy /data
 USER halaxy
 
 # MCP_HOST must be 0.0.0.0 in a container - the script's own default
 # (127.0.0.1) is deliberately safe for direct/non-Docker use, but that
 # would make the server unreachable from outside the container's network
 # namespace. Override the transport, not the secrets (HALAXY_CLIENT_ID/
-# SECRET, MCP_SERVER_TOKEN) - those are supplied at `docker run`/compose
-# time, never baked into the image.
+# SECRET, MCP_LOGIN_USERNAME/PASSWORD) - those are supplied at
+# `docker run`/compose time, never baked into the image.
+#
+# MCP_OAUTH_STATE_FILE points at /data rather than /app - /app gets
+# overwritten by COPY on every image rebuild, but /data is where the
+# compose files mount a persistent volume, so registered OAuth clients
+# and access tokens survive a `docker compose up --build` instead of
+# forcing every connected client to reconnect on every code update.
 ENV MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000
+    MCP_PORT=8000 \
+    MCP_OAUTH_STATE_FILE=/data/oauth_state.json
 
 EXPOSE 8000
 

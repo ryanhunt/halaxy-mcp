@@ -15,4 +15,12 @@ services:
       MCP_PUBLIC_URL: http://127.0.0.1:8000
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      # Persists registered OAuth clients + access tokens across
+      # `docker compose up --build`, so re-testing after a code change
+      # doesn't force every connected client to reconnect.
+      - oauth_state:/data
     restart: unless-stopped
+
+volumes:
+  oauth_state:
