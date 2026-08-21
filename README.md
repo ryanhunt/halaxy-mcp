@@ -21,6 +21,8 @@ This is a small, single-tenant tool built for one practice's own use, not a gene
   Cancelled appointments are excluded entirely (`cancelled_count` reports how many) - detected via the Patient participant's `appointment-participant-status` **modifierExtension** (not `extension`), since the top-level `cancellationReason` field alone isn't reliable.
 
   Meetings also carry `availability_hint` - a best-effort *guess* at whether the meeting is non-working/blocked time, matching keywords in `description` or a blank description. **This is not a real Halaxy field and not availability data** - `likely_non_working: true` must never be read as "free to book a client into".
+
+  Meetings also carry `meeting_category` - `"case_conference"` when the description *starts with* "Case Conference" or "CC with" (a prefix check, not a substring search), else `null`. This answers "does the practitioner have a case conference today" without ever exposing who it's with.
 - **`list_practitioners()`** - clinical staff, each with their PractitionerRole ID and name.
 - **`list_invoices_by_payer(payer_name)`** - every invoice ever billed to a specific insurer/employer/organisation (e.g. "Acme Insurance"), not tied to any date - searches Halaxy's `Invoice?recipient=` directly, so it doesn't have `list_invoices`'s lookback-window blind spot (see below).
 - **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (Medicare Mental Health Treatment Plan, DVA, WorkCover, etc). Each carries a `patient_id`, `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"`, `"expiring_soon"` (within 30 days), `"expired"`. Optionally filter to just one flag.
@@ -170,6 +172,7 @@ Igal Belkin (GrowInsight) independently security-reviewed this server's OAuth im
 - `POST /login/callback` locks out an IP for 15 minutes after 5 failed attempts.
 - `requirements.txt` floors on `mcp>=1.27.2`.
 - `description` is never returned for a meeting, not just a session - a real meeting titled with a client's name showed this was still possible even with no linked Patient. Only its `availability_hint` verdict comes back, never the underlying text.
+- Meetings starting with "Case Conference" or "CC with" are now categorised as `meeting_category: "case_conference"` - lets a caller know that type of meeting exists without ever seeing who it's about.
 - Real refresh tokens are now issued (rotated on every use) - previously every client had to redo the full interactive login every time its 1-hour access token expired.
 
 **Test locally** (no TLS - fine for local testing, not for internet exposure):

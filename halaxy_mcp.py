@@ -1298,6 +1298,34 @@ NON_WORKING_MEETING_KEYWORDS = (
 )
 
 
+# Description PREFIXES (not "contains" - see `_meeting_category`) that
+# mark a meeting as a case conference - a category Kelly specifically
+# wants surfaced (a caller may be told "the practitioner has a case
+# conference"), without ever exposing who it's with. A case conference's
+# description always names the client it's about, which is exactly why
+# only the prefix is checked and the description itself is never
+# returned - matching this is a signal to categorise, not a licence to
+# expose the text that triggered it.
+CASE_CONFERENCE_PREFIXES = ("CASE CONFERENCE", "CC WITH")
+
+
+def _meeting_category(description: str | None) -> str | None:
+    """Categorise a meeting by *type* only - never by exposing its description, per module docstring.
+
+    "case_conference" is the one category recognised so far. Checked as
+    a prefix match, not a substring search: the goal is reading a
+    meeting's declared type off the front of its description, not
+    scanning arbitrary free text for a word that happens to also confirm
+    nothing else about who the meeting concerns. Returns None for
+    anything else - most meetings have no recognised category, which is
+    the expected, unremarkable case, not a sign this should try harder.
+    """
+    text = (description or "").strip().upper()
+    if text.startswith(CASE_CONFERENCE_PREFIXES):
+        return "case_conference"
+    return None
+
+
 def _meeting_availability_hint(description: str | None) -> dict:
     """Best-effort GUESS at whether a meeting is a non-working-time blocker - not a real Halaxy field.
 
@@ -1429,15 +1457,23 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     detect these from this API at all; this is just the closest
     approximation available, offered as a hint.
 
+    Meetings also carry `meeting_category` - `"case_conference"` when
+    the description *starts with* "Case Conference" or "CC with" (a
+    prefix check, not a substring search), else null. This is
+    deliberately a category label, not the description itself: a case
+    conference's description always names a client (that's the point of
+    the meeting), so the answer to "does the practitioner have a case
+    conference today" is meant to be yes/no, never who it's about.
+
     Returns:
         JSON with the target date, each appointment's type, time (never
         the raw `description`, for either type - see above), session
         mode, patient_id (bare Halaxy ID, never a name, or null for a
         meeting), practitioner name (and role ID), linked invoice details
-        including
-        funding_type (or null), awaiting_insurer_invoice, referrals, and
-        (meetings only) availability_hint - plus `cancelled_count`
-        (excluded from `appointments` itself).
+        including funding_type (or null), awaiting_insurer_invoice,
+        referrals, and (meetings only) availability_hint and
+        meeting_category - plus `cancelled_count` (excluded from
+        `appointments` itself).
     """
     if date is None:
         date = datetime.now(PRACTICE_TIMEZONE).strftime("%Y-%m-%d")
@@ -1490,6 +1526,9 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
                 "invoice_id": refs["invoice_id"],
                 "availability_hint": (
                     _meeting_availability_hint(appt.get("description")) if this_type == "meeting" else None
+                ),
+                "meeting_category": (
+                    _meeting_category(appt.get("description")) if this_type == "meeting" else None
                 ),
             }
         )
