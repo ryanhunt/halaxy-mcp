@@ -82,6 +82,7 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -821,7 +822,23 @@ def _invoice_funding_type(inv: dict) -> str:
     return "organisation" if inv.get("recipient", {}).get("type") == "Organization" else "self"
 
 
-@mcp.tool()
+def _read_only_tool_annotations(title: str) -> ToolAnnotations:
+    """Every tool this server exposes shares the same shape, so this is the one place their
+    annotation hints are set rather than repeating them five times: each is a read-only Halaxy
+    query, never destructive, safe to call repeatedly with the same arguments, and scoped to one
+    practice's own Halaxy account - a closed, well-defined external system, not an open-ended one
+    like web search (which is what `openWorldHint` distinguishes, per the MCP spec).
+    """
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+
+@mcp.tool(annotations=_read_only_tool_annotations("List invoices"))
 def list_invoices(date: str | None = None) -> str:
     """List Halaxy invoices dated a given day.
 
@@ -946,7 +963,7 @@ def _get_practitioner_role_names() -> dict[str, dict]:
     return role_id_to_info
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only_tool_annotations("List practitioners"))
 def list_practitioners() -> str:
     """List clinical staff (practitioners), each with their PractitionerRole ID and name.
 
@@ -1362,7 +1379,7 @@ def _meeting_availability_hint(description: str | None) -> dict:
     return {"likely_non_working": False, "confidence": None, "reason": None}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only_tool_annotations("List appointments"))
 def list_appointments(date: str | None = None, appointment_type: str | None = None) -> str:
     """List appointments for a given day, each tagged as a client "session" or a "meeting".
 
@@ -1574,7 +1591,7 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only_tool_annotations("List invoices by payer"))
 def list_invoices_by_payer(payer_name: str) -> str:
     """Search every invoice ever billed to a specific insurer/employer/organisation.
 
@@ -1631,7 +1648,7 @@ def list_invoices_by_payer(payer_name: str) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only_tool_annotations("List referrals"))
 def list_referrals(flag: str | None = None) -> str:
     """List every active Referral in the practice, with session/dollar limits, expiry, and status flags.
 

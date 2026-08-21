@@ -8,6 +8,8 @@ This is a small, single-tenant tool built for one practice's own use, not a gene
 
 ## Tools
 
+All five carry the standard [MCP tool annotation hints](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations) - `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false` - since every one is a read-only Halaxy query, safe to call repeatedly, scoped to one practice's own account.
+
 - **`list_invoices(date)`** - invoices dated a given day (defaults to today). Each invoice has `patient_id` (a bare Halaxy ID, only present when the payer is an actual patient), a `funding_type` (`"self"` or `"organisation"` - see [Patient data](#patient-data) below), and a `payer_name` (only present when `funding_type` is `"organisation"`).
 - **`list_appointments(date, appointment_type)`** - appointments for a given day, each tagged `"session"` (a real client appointment) or `"meeting"` (a blocker/reminder/internal note - anything with no linked patient). Sessions also carry:
   - `session_mode` - `"F2F"` or `"Telehealth"`, resolved from the HealthcareService the appointment is booked against
