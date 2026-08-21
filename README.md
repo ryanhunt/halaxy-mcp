@@ -12,18 +12,16 @@ This is a small, single-tenant tool built for one practice's own use, not a gene
 - **`list_appointments(date, appointment_type)`** - appointments for a given day, each tagged `"session"` (a real client appointment) or `"meeting"` (a blocker/reminder/internal note - anything with no linked patient). Sessions also carry:
   - `session_mode` - `"F2F"` or `"Telehealth"`, resolved from the HealthcareService the appointment is booked against
   - `patient_id` - a bare Halaxy ID, nothing else (see [Patient data](#patient-data) below)
-  - `invoice` - the linked invoice, if one's been raised, via Halaxy's direct appointment→invoice reference (more reliable than matching by date - see the notes in the code), including `funding_type`
-  - `awaiting_insurer_invoice` - populated only when there's no invoice yet *and* the patient has an active Coverage on file flagged "billed to an organisation" - i.e. flags a session that's expected to be billed to an insurer/employer but hasn't been yet
-  - `referrals` - the patient's active Referral(s) (see `list_referrals` below), so their current session count is right there without a second call
+  - `invoice` - the linked invoice, if one's been raised, via Halaxy's direct appointment→invoice reference, including `funding_type`
+  - `awaiting_insurer_invoice` - populated only when there's no invoice yet *and* the patient has an active Coverage on file flagged "billed to an organisation" - a session expected to be billed to an insurer/employer but not yet
+  - `referrals` - the patient's active Referral(s) (see `list_referrals` below)
 
-  Cancelled appointments are excluded entirely (`cancelled_count` reports how many). This was a real bug, found and fixed: Halaxy's `Appointment?date=eq...` search returns cancelled appointments right alongside real ones, with nothing at the top level marking them as such - one showed up looking like a perfectly ordinary upcoming session. The obvious-looking `cancellationReason` field is *not* reliable by itself (confirmed against real data - many genuinely-cancelled appointments don't have it set); the signal that held up is the Patient participant's `appointment-participant-status` **modifierExtension** (not `extension`) being `"cancelled"`.
+  Cancelled appointments are excluded entirely (`cancelled_count` reports how many) - detected via the Patient participant's `appointment-participant-status` **modifierExtension** (not `extension`), since the top-level `cancellationReason` field alone isn't reliable.
 
-  Meetings also carry `availability_hint` - a best-effort *guess* at whether the meeting is non-working/blocked time (a break, leave, etc.), matching keywords in `description` or a blank description. **This is not a real Halaxy field and not availability data** - `likely_non_working: true` must never be read as "free to book a client into". Confirmed against real calendar screenshots: Halaxy's own UI shows generic blocker titles (e.g. "BREAK") for meetings the API returns with a *completely blank* `description` - there's no field anywhere carrying that title, so keyword-matching alone would miss real blockers entirely; the blank-description signal is what actually catches them, at lower confidence.
-- **`list_practitioners()`** - clinical staff, each with their PractitionerRole ID and name, so a client can resolve "what's on for Alice today" to a role ID before matching it against `list_appointments`.
+  Meetings also carry `availability_hint` - a best-effort *guess* at whether the meeting is non-working/blocked time, matching keywords in `description` or a blank description. **This is not a real Halaxy field and not availability data** - `likely_non_working: true` must never be read as "free to book a client into".
+- **`list_practitioners()`** - clinical staff, each with their PractitionerRole ID and name.
 - **`list_invoices_by_payer(payer_name)`** - every invoice ever billed to a specific insurer/employer/organisation (e.g. "Acme Insurance"), not tied to any date - searches Halaxy's `Invoice?recipient=` directly, so it doesn't have `list_invoices`'s lookback-window blind spot (see below).
-- **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (most commonly a Medicare Mental Health Treatment Plan - "6 sessions to start", as most people know it - but also DVA, WorkCover, etc). Each carries a `patient_id`, `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"` (used ≥ authorized), `"expiring_soon"` (ends within 30 days), `"expired"`. Optionally filter to just one flag.
-
-There used to be a sixth tool, `find_patient(name)`, for "what's \<client\>'s phone number" style questions. It's been deliberately removed - see [Patient data](#patient-data) below for why.
+- **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (Medicare Mental Health Treatment Plan, DVA, WorkCover, etc). Each carries a `patient_id`, `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"`, `"expiring_soon"` (within 30 days), `"expired"`. Optionally filter to just one flag.
 
 ## Required Halaxy API key scopes
 
@@ -34,8 +32,8 @@ Create an API key in Halaxy (Settings → API Keys) with whichever of these you 
 | Appointments → Retrieve | `list_appointments` |
 | Invoices & Payments → Retrieve, Retrieve Fees | `list_invoices`, `list_invoices_by_payer` |
 | Practitioners → Retrieve | `list_practitioners`, practitioner names in `list_appointments` |
-| Claims & Referrals → Retrieve Claim | `awaiting_insurer_invoice`, `list_invoices_by_payer` (this is Halaxy's plain-English label for read access to the FHIR `Coverage` resource) |
-| Claims & Referrals → Retrieve Referral | `list_referrals`, `referrals` in `list_appointments` (read access to the FHIR `Referral` resource) |
+| Claims & Referrals → Retrieve Claim | `awaiting_insurer_invoice`, `list_invoices_by_payer` (Halaxy's label for read access to the FHIR `Coverage` resource) |
+| Claims & Referrals → Retrieve Referral | `list_referrals`, `referrals` in `list_appointments` |
 
 **`Patients → Retrieve` is deliberately left off** - this server never calls Halaxy's `Patient` endpoint at all (see [Patient data](#patient-data) below), so it doesn't need that scope enabled. Leaving it off is a real, Halaxy-side guarantee that no patient data beyond a bare ID could leave this server, not just a code-level one.
 
@@ -45,33 +43,31 @@ Example of what this looks like in Halaxy's own API key scope screen:
 
 ## Patient data
 
-This server never returns a patient's name, phone number, email, DOB, address, gender, or any other identifying field - only a bare, opaque `patient_id`, the same ID already carried on the appointment/invoice/referral resource itself. It doesn't even call Halaxy's `Patient` endpoint to look one up (see the scopes table above) - there's no Patient resource fetched, so there's nothing beyond an ID to leak.
+This server never returns a patient's name, phone number, email, DOB, address, gender, or any other identifying field - only a bare, opaque `patient_id`, the same ID already carried on the appointment/invoice/referral resource itself. There's no Patient resource fetched at all, so there's nothing beyond an ID to leak.
 
-This is a deliberate privacy-law decision, not just "no DOB/address/gender": for a psychology practice, a client's *name* tied to a session is itself health information under Australia's Privacy Act, and health service providers don't get the small-business exemption other businesses can rely on regardless of size. Disclosing that to a third-party AI vendor's servers needs its own lawful basis - a legal/policy question for the practice running this, not something this server should quietly decide by exposing the data. Concretely, that means:
+This is a deliberate privacy-law decision, not just "no DOB/address/gender": for a psychology practice, a client's *name* tied to a session is itself health information under Australia's Privacy Act, and health service providers don't get the small-business exemption other businesses can rely on regardless of size. Disclosing that to a third-party AI vendor's servers needs its own lawful basis - a legal/policy question for the practice running this, not something this server should quietly decide by exposing the data. Concretely:
 
-- No tool returns a patient's name, phone, or email - ever, for any input.
-- No lookup-by-name tool exists (there used to be a `find_patient(name)`, removed for this reason).
-- No tool answers "who is this session/invoice/referral with" - only "what `patient_id`, and what non-identifying fact" (e.g. `funding_type`, `session_mode`, referral limits).
-- Invoice titles and session `description` fields - free text Halaxy lets staff put a client's name into - are withheld too, not just structured Patient fields. A patient-billed invoice's `payer_name` is `null` (Halaxy titles those with the patient's own name); an insurer/employer-billed invoice's `payer_name` is returned, since that name isn't patient data. `funding_type` (`"self"` vs. `"organisation"`) gives you the self-funded/insurer-funded distinction without a name either way.
-- Every tool's own docstring instructs the calling model on how to answer identity-style questions ("who is my 2pm with") - along the lines of "I can't tell you who that's with, but it's a self-funded F2F session" - rather than guessing. That's guidance for the model, not a substitute for the hard control above (there's simply no name in the data for it to relay).
+- No tool returns a patient's name, phone, or email, and no tool answers "who is this session/invoice/referral with" - only a `patient_id` plus non-identifying facts (`funding_type`, `session_mode`, referral limits).
+- Invoice titles and session `description` fields - free text Halaxy lets staff put a client's name into - are withheld too, not just structured Patient fields. `funding_type` (`"self"` vs. `"organisation"`) gives you the self-funded/insurer-funded distinction without a name.
+- Every tool's own docstring instructs the calling model on how to answer identity-style questions ("who is my 2pm with") without guessing - though that's guidance for the model, not a substitute for there simply being no name in the data to relay.
 
-If a future need genuinely requires some identifying patient data, that's a decision to make deliberately (widening what's returned in `halaxy_mcp.py`, and re-enabling `Patients → Retrieve` on the API key) - not something that should happen by accident.
+Widening this deliberately (re-enabling `Patients → Retrieve` and what `halaxy_mcp.py` returns) is a decision to make on purpose, not something that should happen by accident.
 
-**Clinical/session notes are not retrievable through this API at all, for any key or scope.** Halaxy's own `/metadata` capability statement shows its clinical-notes resource (`DocumentReference`) supports `create`/`patch` only - no read, matching what the Halaxy UI itself shows (Clinical Notes only has a Create toggle). This is a whole-API limitation, not something this server chooses not to expose.
+**Clinical/session notes are not retrievable through this API at all, for any key or scope** - Halaxy's `DocumentReference` resource supports `create`/`patch` only, no read. A whole-API limitation, not something this server chooses not to expose.
 
 ## Referrals and session limits
 
-Halaxy models a GP Mental Health Treatment Plan (and similar - DVA, WorkCover) as a `Referral` linked to a `ReferralDefinition` (the referral *type*, which carries the session/dollar cap - e.g. one real `ReferralDefinition` in testing was literally named "Medicare: MHTP Referral" with a 6-session limit). `sessions_remaining` isn't returned by Halaxy directly; it's computed here as `sessions_total - sessions_used`.
+Halaxy models a GP Mental Health Treatment Plan (and similar - DVA, WorkCover) as a `Referral` linked to a `ReferralDefinition` (the referral *type*, which carries the session/dollar cap). `sessions_remaining` isn't returned by Halaxy directly; it's computed here as `sessions_total - sessions_used`.
 
-A few things confirmed against real data, worth knowing if you extend this further:
-- A patient can have more than one simultaneously-active Referral (e.g. one per referred-to practitioner) - this server doesn't try to guess "the" one; it returns all of them.
-- `sessions_used` can exceed `sessions_total` in practice (Medicare doesn't hard-stop bookings at the cap) - that's what the `"over_limit"` flag is for.
-- Some Referral records have no structured type/referrer at all, just a free-text `comment` - surfaced as-is when that's the only clue available.
-- Halaxy's own `active` field on a Referral doesn't appear to auto-flip to false once its period lapses - the `"expired"`/`"expiring_soon"` flags are computed from `period.end`, not read off `active`.
+Worth knowing if you extend this further:
+- A patient can have more than one simultaneously-active Referral - this server returns all of them rather than guessing "the" one.
+- `sessions_used` can exceed `sessions_total` (Medicare doesn't hard-stop bookings at the cap) - that's what `"over_limit"` is for.
+- Some Referral records have no structured type/referrer, just a free-text `comment` - surfaced as-is.
+- Halaxy's own `active` field doesn't auto-flip to false once a Referral's period lapses - `"expired"`/`"expiring_soon"` are computed from `period.end` instead.
 
 ## If a scope isn't enabled
 
-Every tool needs its matching scope switched on for the API key it's using (see the table above). If a scope is missing, Halaxy responds with a 401/403 or an `OperationOutcome` error - the server raises a clear `HalaxyPermissionError` (naming the resource, the HTTP status, and Halaxy's own error text) rather than silently treating that as "zero results". Without this check, a missing scope and a genuinely empty result (e.g. "no invoices today") would look identical to the MCP client.
+If a scope is missing, Halaxy responds with a 401/403 or an `OperationOutcome` error - the server raises a clear `HalaxyPermissionError` (naming the resource, the HTTP status, and Halaxy's own error text) rather than silently treating that as "zero results", so a missing scope and a genuinely empty result don't look identical to the MCP client.
 
 ## Install
 
@@ -148,34 +144,29 @@ No `env` block is needed in any of these - the script loads its own `.env` file 
 
 ## Docker / HTTP transport
 
-For a remote MCP client that connects from cloud infrastructure rather than a local device (Claude's "custom connector", Microsoft 365 Copilot's "federated connector"), run the same script over HTTP instead of stdio: `MCP_TRANSPORT=http` starts a `uvicorn` server instead of talking over stdin/stdout - the Dockerfile sets this for you.
+For a remote MCP client that connects from cloud infrastructure rather than a local device (Claude's "custom connector", Microsoft 365 Copilot's Copilot Studio agent), run the same script over HTTP instead of stdio: `MCP_TRANSPORT=http` starts a `uvicorn` server instead of talking over stdin/stdout - the Dockerfile sets this for you.
 
-**Auth**: real OAuth 2.1, not a static token. Confirmed against Claude's actual "Add custom connector" dialog: it requires a genuine OAuth flow (there's no field to paste a bearer token into - only optional "OAuth Client ID/Secret" fields).
+**Auth**: real OAuth 2.1 with Dynamic Client Registration, not a static token - leave any "OAuth Client ID/Secret" fields in your MCP client blank, since there's no pre-registered client to use instead.
 
-**Leave those OAuth Client ID/Secret fields blank.** This server supports Dynamic Client Registration - Claude registers itself automatically the first time someone connects, generating its own client_id on the fly. Confirmed live: pre-filling either field breaks the connection, since Dynamic Client Registration is the *only* registration path this server implements - there's no pre-registered client for Claude to use instead.
-
-Rather than standing up a separate identity provider, this server acts as its own minimal, self-contained OAuth authorization server - adapted from Anthropic's own reference pattern ([`examples/servers/simple-auth`](https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/servers/simple-auth) in `modelcontextprotocol/python-sdk`, the "legacy" combined authorization-server-plus-resource-server mode). `_SimpleOAuthProvider` handles client registration, `/authorize`, a plain login page (`/login`), authorization codes, and access tokens - **persisted to a small JSON file** (`MCP_OAUTH_STATE_FILE`, defaults to `oauth_state.json` next to the script; in Docker this points at `/data`, mounted as a volume in both compose files) rather than kept purely in memory. This matters in practice: without it, every `docker compose up --build` (i.e. every code update) restarts the process and silently wipes every registered client and access token, forcing every connected client to reconnect - which surfaces as an opaque "permission required"-style error with no obvious cause. The state file holds live access tokens, so it's written with `0600` permissions and via a temp-file-then-rename (atomic on POSIX, so a crash mid-write can't leave a corrupt file behind) - it's gitignored and never baked into the image. "Signing in" is one shared username/password (`MCP_LOGIN_USERNAME`/`MCP_LOGIN_PASSWORD` in `.env`) - not a per-person identity system, which is a reasonable simplification for a small practice/team. `MCP_PUBLIC_URL` is the public HTTPS URL clients actually reach this server at (behind Caddy on a real deployment) - the OAuth issuer/redirect base, and *not* the same as the internal `MCP_HOST`/`MCP_PORT` the container binds to.
+This server acts as its own minimal, self-contained OAuth authorization server (adapted from Anthropic's reference pattern, [`examples/servers/simple-auth`](https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/servers/simple-auth)). Registered clients and access tokens are **persisted to a small JSON file** (`MCP_OAUTH_STATE_FILE`; in Docker this points at `/data`, mounted as a volume) so a redeploy doesn't force every connected client to reconnect. That file holds live access tokens, so it's `0600`-permissioned, written atomically, gitignored, and never baked into the image. "Signing in" is one shared username/password (`MCP_LOGIN_USERNAME`/`MCP_LOGIN_PASSWORD`) - fine for a small practice, not a per-person identity system. `MCP_PUBLIC_URL` is the public HTTPS URL clients reach this server at (behind Caddy) - the OAuth issuer/redirect base, not the same as the internal `MCP_HOST`/`MCP_PORT`.
 
 ### Security hardening (credit: Igal Belkin, GrowInsight)
 
-**Igal Belkin (GrowInsight) independently security-reviewed this server's OAuth implementation and reported a full consent-phishing/token-theft chain**, reproduced end-to-end against a running instance: open Dynamic Client Registration plus a login page that showed nothing about who was requesting access meant anyone could register their own client pointed at an attacker-controlled `redirect_uri`, send a legitimate-looking sign-in link, and walk away with an authorization code once someone signed in - one token here reads the whole practice's Halaxy data, so this mattered a lot. He also found a reflected XSS on that same login page (worse in combination - the injected page *is* the password prompt), and an `mcp` version pin that could resolve to a build missing a field this code relies on, 500ing the token exchange. All three, independently verified before merging, not just taken on faith:
+Igal Belkin (GrowInsight) independently security-reviewed this server's OAuth implementation and reported several real issues in it, since fixed. As part of that:
 
-- **Consent-phishing (fixed)**: newly-registered clients' `redirect_uri` is now checked against `MCP_ALLOWED_REDIRECT_URI_HOSTS` when that's configured, and the login page now shows the requesting client's name and where you'll be sent afterwards, so there's something to actually check before typing the shared password. **Set this before treating a deployment as done** - add only the hosts for the AI services you actually use, confirmed live against real connections:
+- New client registrations are restricted to `MCP_ALLOWED_REDIRECT_URI_HOSTS` (comma-separated hostnames) when set, and the login page shows the requesting client's name and redirect target before you sign in. **Set this before treating a deployment as done** - add only the hosts for the AI services you actually use:
 
   | AI service | Host to add | Notes |
   |---|---|---|
   | Claude (custom connector) | `claude.ai` | |
   | ChatGPT (connector) | `chatgpt.com` | |
-  | Microsoft 365 Copilot (via Copilot Studio) | `global.consent.azure-apim.net` | Registers under the client name "Credential Manager" - Microsoft's own Power Platform OAuth consent host, not something you configure yourself |
-  | OpenAI Codex CLI, or any other native/CLI MCP client | `127.0.0.1` | Uses a loopback redirect with a random port each session (the standard [RFC 8252](https://datatracker.ietf.org/doc/html/rfc8252) native-app pattern) - matched by hostname only, so one entry covers every port it ever picks |
+  | Microsoft 365 Copilot (via Copilot Studio) | `global.consent.azure-apim.net` | Registers under the client name "Credential Manager" - Microsoft's own Power Platform OAuth consent host |
+  | OpenAI Codex CLI, or any other native/CLI MCP client | `127.0.0.1` | Loopback redirect with a random port each session ([RFC 8252](https://datatracker.ietf.org/doc/html/rfc8252) native-app pattern) - matched by hostname only, so one entry covers every port |
 
-  See `.env.example` for how to find a host you don't recognize (check this server's own logs right after a client tries to connect - the real redirect_uri is right there in a successful `POST /register`, no guessing needed) and how to handle a client that connected *before* this setting existed (it may be reusing a stale, now-unregistered `client_id` and need a manual disconnect/reconnect on its own end).
-- **Reflected XSS (fixed)**: every value the login page renders is HTML-escaped, an unrecognised `state` is rejected outright rather than still rendering a page, and the login page now sends `Content-Security-Policy`, `X-Frame-Options`, and `X-Content-Type-Options` headers.
-- **`state` binding (fixed)**: the authorization flow's internal lookup key is now always server-generated, never the client-supplied `state` value (which is tracked separately and echoed back untouched, per spec).
-- **No login throttling (fixed)**: `POST /login/callback` now locks out an IP for 15 minutes after 5 failed attempts.
-- **`mcp` version floor (fixed)**: bumped to `mcp>=1.27.2` - `1.27.0`/`1.27.1` are missing the `subject` field this code sets on token exchange, and would 500 instead of connecting.
-
-If you deployed this before this section existed, **rotate your Halaxy API key and `MCP_LOGIN_PASSWORD`** after updating, on general principle - not because compromise was detected, but because there's no way to know in hindsight whether the gap above was ever probed.
+  See `.env.example` for how to find a host not listed above, and how to recover a client that cached a `client_id` from before this setting existed.
+- The login page HTML-escapes everything it renders, rejects an unrecognised `state` outright, and sends `Content-Security-Policy`/`X-Frame-Options`/`X-Content-Type-Options` headers.
+- `POST /login/callback` locks out an IP for 15 minutes after 5 failed attempts.
+- `requirements.txt` floors on `mcp>=1.27.2`.
 
 **Test locally** (no TLS - fine for local testing, not for internet exposure):
 
@@ -187,11 +178,11 @@ curl http://127.0.0.1:8000/mcp      # -> 401, no token
 curl http://127.0.0.1:8000/.well-known/oauth-authorization-server  # -> OAuth discovery metadata
 ```
 
-An MCP client does the rest automatically (register → authorize → login → token exchange) - verified this full flow by hand with curl through the actual container before relying on it.
+An MCP client does the rest automatically (register → authorize → login → token exchange).
 
 **Deploy it somewhere internet-facing** (e.g. a Raspberry Pi behind your own router): use `docker-compose.pi.yml` instead, which adds [Caddy](https://caddyserver.com/) in front for TLS (Let's Encrypt, auto-issued/renewed) and doesn't publish the app's port directly - only Caddy is reachable from outside the container network.
 
-This builds **directly on the target device** - no cross-compilation needed. Docker just produces whatever architecture image matches the device's own CPU, automatically. Verified working on both 64-bit (`arm64`/`aarch64` - a Pi 3B+ and up) and 32-bit (`armv7`/`armhf` - a Pi 2, or a Pi 3/4 on 32-bit Raspberry Pi OS) by actually building and running the image under QEMU emulation for both, not just assuming it'd work.
+This builds **directly on the target device** - no cross-compilation needed. Works on both 64-bit (`arm64`/`aarch64` - Pi 3B+ and up) and 32-bit (`armv7`/`armhf` - a Pi 2, or a Pi 3/4 on 32-bit Raspberry Pi OS).
 
 ```bash
 # check what you're running, if unsure:
@@ -221,44 +212,44 @@ cp Caddyfile.example Caddyfile && nano Caddyfile   # your real domain/DDNS hostn
 docker compose -f docker-compose.pi.yml up -d --build
 ```
 
-`MCP_PUBLIC_URL` (in `.env`) must be the real `https://your-domain` clients will connect to - it's used as the OAuth issuer/redirect base and has to match exactly. `docker compose -f docker-compose.pi.yml ps`/`logs -f` to check it's up; `restart: unless-stopped` means it survives a reboot as long as Docker itself starts on boot (the install script above enables that by default). To update later: `git pull && docker compose -f docker-compose.pi.yml up -d --build` - or just `./update.sh`, which does the same thing and then polls `/health` on `MCP_PUBLIC_URL` a few times to confirm it actually came back up. Nothing in `.env`/`Caddyfile` is touched by `git pull` (both are gitignored).
+`MCP_PUBLIC_URL` (in `.env`) must be the real `https://your-domain` clients will connect to - it's used as the OAuth issuer/redirect base and has to match exactly. `docker compose -f docker-compose.pi.yml ps`/`logs -f` to check it's up; `restart: unless-stopped` means it survives a reboot as long as Docker itself starts on boot. To update later: `git pull && docker compose -f docker-compose.pi.yml up -d --build` - or `./update.sh`, which does the same and polls `/health` afterwards. Nothing in `.env`/`Caddyfile` is touched by `git pull` (both are gitignored).
 
-**Building for 32-bit ARM (`armv7`) needs a bit more than `pip install`, already handled in the Dockerfile**: `cryptography` (pulled in for the OAuth code) has prebuilt wheels for 64-bit platforms but not `armv7` - there it compiles a small piece (`cffi`) from source, which needs a C compiler and libc's headers. The Dockerfile installs `gcc`/`libc6-dev`/`libffi-dev` before `pip install` and removes them again afterwards to keep the image small - worth knowing if you ever modify the Dockerfile yourself, since `libc6-dev` in particular is easy to leave out by mistake (it's only a "Recommends" of `gcc` on Debian, not a hard dependency, so `--no-install-recommends` silently drops it and the build fails with a `stdlib.h: No such file or directory` error).
+**32-bit ARM (`armv7`) builds need a C compiler**, already handled in the Dockerfile: `cryptography` compiles a small piece (`cffi`) from source on `armv7` (no prebuilt wheel), needing `gcc`/`libc6-dev`/`libffi-dev` - installed before `pip install` and removed afterwards to keep the image small.
 
-You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of the login gate, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges (these change over time, so check the current values rather than hardcoding them).
+You'll still need to handle port-forwarding (80+443) and firewall rules on your own network/router - and as defense-in-depth on top of the login gate, consider restricting inbound traffic to your MCP client's currently-published outbound IP ranges.
 
 ## Confirmed working with
 
-- **Claude** (custom connector) - the full OAuth flow (register → login page → connect) has been verified end-to-end against a real deployment, not just locally.
-- **GitHub Copilot** (VS Code, Visual Studio, Copilot CLI) - the stdio path (above) is verified; the HTTP/OAuth path hasn't specifically been tried with it, but there's no reason to expect it wouldn't work the same way, since it's the same standard OAuth 2.1 + Dynamic Client Registration flow Claude and ChatGPT use.
-- **Microsoft 365 Copilot** (via a Copilot Studio agent with an MCP tool) - confirmed working. See [Setting this up in Microsoft 365 Copilot](#setting-this-up-in-microsoft-365-copilot) below - it's not the same "paste a URL" flow as Claude.
-- **ChatGPT** - confirmed working, unmodified. Good evidence this server's plain OAuth 2.1 + Dynamic Client Registration implementation is portable across MCP clients generally, not tuned to one client's specific behaviour.
+- **Claude** (custom connector) - full OAuth flow verified against a real deployment.
+- **GitHub Copilot** (VS Code, Visual Studio, Copilot CLI) - the stdio path is verified; the HTTP/OAuth path should work the same way (same standard OAuth 2.1 + DCR flow) but hasn't specifically been tried.
+- **Microsoft 365 Copilot** (via a Copilot Studio agent with an MCP tool) - see [Setting this up in Microsoft 365 Copilot](#setting-this-up-in-microsoft-365-copilot) below.
+- **ChatGPT** - works unmodified.
 
 ### Setting this up in Microsoft 365 Copilot
 
-Unlike Claude's "paste a URL and connect" custom connector, Microsoft 365 Copilot doesn't let you add a private server directly to its own connector gallery - that gallery (called "federated connectors") requires Microsoft's review/approval to list a server there at all, which isn't viable for a private/self-hosted tool. The actual self-service path is **Copilot Studio** - a separate product used to build a small "agent" that's then published into Teams/Microsoft 365 Copilot:
+Microsoft 365 Copilot doesn't let you add a private server directly to its connector gallery (that requires Microsoft's review/approval). The self-service path is **Copilot Studio** - a separate product used to build a small "agent" published into Teams/Microsoft 365 Copilot:
 
-1. In Copilot Studio, create an **Agent** (not "Workflow" - that's for automated multi-step processes, not tool-calling).
+1. In Copilot Studio, create an **Agent** (not "Workflow").
 2. On the agent's **Tools** page: **Add a tool** → **New tool** → **Model Context Protocol**.
 3. **Server URL**: `https://your-domain.example.com/mcp`. **Authentication type**: OAuth 2.0.
-4. Try **"Dynamic discovery"** first - it's built for exactly what this server supports (Dynamic Client Registration). If it fails (this server exposes the older `/.well-known/oauth-authorization-server` discovery style, which satisfied Claude and ChatGPT, but not the newer RFC 9728 `/.well-known/oauth-protected-resource` metadata some clients look for first), fall back to the **"Dynamic"** option and fill in manually:
+4. Try **"Dynamic discovery"** first. If it fails, fall back to **"Dynamic"** and fill in manually:
    - **Authorization URL**: `https://your-domain.example.com/authorize`
    - **Token URL template**: `https://your-domain.example.com/token`
-5. Write **Instructions** for the agent describing what it can help with and its real limits - it's worth being explicit, since the agent won't otherwise know what the underlying tools can't do.
+5. Write **Instructions** for the agent describing what it can help with and its real limits.
 6. **Publish**, selecting **Teams + Microsoft 365** as the channel.
 
-**Licensing, worth knowing before you start**: building an agent in Copilot Studio needs *some* Copilot Studio access (a trial license lets you build and test in the builder's own preview panel, but can't publish). *Using* a published agent through Microsoft 365 Copilot Chat/Teams needs a real (paid, not free "Basic") Microsoft 365 Copilot license for each user - per Microsoft's own billing docs, agent actions (which includes calling an MCP tool) are "No charge" against that license for real end-use, so once real licenses are assigned, ongoing usage for a small team shouldn't need a separate Copilot Studio credit purchase or Azure pay-as-you-go setup. If a newly-assigned license doesn't seem to take effect immediately, try a full sign-out/sign-in before assuming something's actually wrong - license propagation can lag behind the assignment itself.
+**Licensing**: building an agent needs Copilot Studio access (a trial license can build/preview but not publish). *Using* a published agent through Copilot Chat/Teams needs a real (paid, not free "Basic") Microsoft 365 Copilot license per user - agent actions are "No charge" against that license per Microsoft's billing docs. If a newly-assigned license doesn't seem to take effect, try a full sign-out/sign-in - propagation can lag.
 
 ## Known limitations, worth knowing about
 
-- **`list_invoices`'s lookback window can miss invoices.** Halaxy's `Invoice` search has no parameter for the invoice's own `date` field, only `created`/`_lastUpdated` - so `list_invoices` fetches invoices created in the last 45 days and filters client-side for an exact `date` match. Insurer/employer-billed invoices (e.g. workers' comp) are sometimes created months before the session they end up dated for, which can fall outside that window. `list_appointments` doesn't have this problem (it follows the appointment→invoice link directly), and `list_invoices_by_payer` doesn't either (it searches by recipient, unbounded by date) - prefer those when the date-based blind spot matters.
-- **`session` vs. `meeting` is inferred from whether the appointment has a linked `Patient` participant**, not from any explicit Halaxy field - a real session booked without linking a patient record in Halaxy would be miscategorised as a meeting.
+- **`list_invoices`'s lookback window can miss invoices.** Halaxy's `Invoice` search has no parameter for the invoice's own `date` field, only `created`/`_lastUpdated` - so `list_invoices` fetches invoices created in the last 45 days and filters client-side for an exact `date` match. Insurer/employer-billed invoices can be created months before the session they end up dated for, falling outside that window. `list_appointments` and `list_invoices_by_payer` don't have this problem - prefer those when it matters.
+- **`session` vs. `meeting` is inferred from whether the appointment has a linked `Patient` participant**, not any explicit Halaxy field - a session booked without linking a patient record would be miscategorised as a meeting.
 - No write operations (create/update anything) are implemented, on purpose.
-- The HTTP transport's OAuth authorization server is a minimal, self-contained implementation with one shared login (not per-person accounts) - see [Docker / HTTP transport](#docker--http-transport) above. Verified working against Claude's connector requirements specifically; other MCP clients may expect something different.
+- The HTTP transport's OAuth authorization server has one shared login (not per-person accounts) - see [Docker / HTTP transport](#docker--http-transport) above.
 
 ## What it deliberately doesn't do
 
-This wraps a handful of read-only endpoints matching one practice's own needs, not a general Halaxy/FHIR client. It does not implement patient creation/updates, clinical notes, scheduling changes, or most of Halaxy's ~50-resource FHIR surface (referral *tracking* is covered - see above - but not creating/updating referrals). If you need more of the API, the tool functions in `halaxy_mcp.py` are a reasonably short, readable starting point to extend from.
+This wraps a handful of read-only endpoints matching one practice's own needs, not a general Halaxy/FHIR client. It does not implement patient creation/updates, clinical notes, scheduling changes, or most of Halaxy's ~50-resource FHIR surface (referral *tracking* is covered, not creating/updating referrals). If you need more of the API, the tool functions in `halaxy_mcp.py` are a reasonably short, readable starting point to extend from.
 
 ## License
 
