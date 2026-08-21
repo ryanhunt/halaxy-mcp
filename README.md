@@ -160,7 +160,16 @@ Rather than standing up a separate identity provider, this server acts as its ow
 
 **Igal Belkin (GrowInsight) independently security-reviewed this server's OAuth implementation and reported a full consent-phishing/token-theft chain**, reproduced end-to-end against a running instance: open Dynamic Client Registration plus a login page that showed nothing about who was requesting access meant anyone could register their own client pointed at an attacker-controlled `redirect_uri`, send a legitimate-looking sign-in link, and walk away with an authorization code once someone signed in - one token here reads the whole practice's Halaxy data, so this mattered a lot. He also found a reflected XSS on that same login page (worse in combination - the injected page *is* the password prompt), and an `mcp` version pin that could resolve to a build missing a field this code relies on, 500ing the token exchange. All three, independently verified before merging, not just taken on faith:
 
-- **Consent-phishing (fixed)**: newly-registered clients' `redirect_uri` is now checked against `MCP_ALLOWED_REDIRECT_URI_HOSTS` (see `.env.example`) when that's configured, and the login page now shows the requesting client's name and where you'll be sent afterwards, so there's something to actually check before typing the shared password.
+- **Consent-phishing (fixed)**: newly-registered clients' `redirect_uri` is now checked against `MCP_ALLOWED_REDIRECT_URI_HOSTS` when that's configured, and the login page now shows the requesting client's name and where you'll be sent afterwards, so there's something to actually check before typing the shared password. **Set this before treating a deployment as done** - add only the hosts for the AI services you actually use, confirmed live against real connections:
+
+  | AI service | Host to add | Notes |
+  |---|---|---|
+  | Claude (custom connector) | `claude.ai` | |
+  | ChatGPT (connector) | `chatgpt.com` | |
+  | Microsoft 365 Copilot (via Copilot Studio) | `global.consent.azure-apim.net` | Registers under the client name "Credential Manager" - Microsoft's own Power Platform OAuth consent host, not something you configure yourself |
+  | OpenAI Codex CLI, or any other native/CLI MCP client | `127.0.0.1` | Uses a loopback redirect with a random port each session (the standard [RFC 8252](https://datatracker.ietf.org/doc/html/rfc8252) native-app pattern) - matched by hostname only, so one entry covers every port it ever picks |
+
+  See `.env.example` for how to find a host you don't recognize (check this server's own logs right after a client tries to connect - the real redirect_uri is right there in a successful `POST /register`, no guessing needed) and how to handle a client that connected *before* this setting existed (it may be reusing a stale, now-unregistered `client_id` and need a manual disconnect/reconnect on its own end).
 - **Reflected XSS (fixed)**: every value the login page renders is HTML-escaped, an unrecognised `state` is rejected outright rather than still rendering a page, and the login page now sends `Content-Security-Policy`, `X-Frame-Options`, and `X-Content-Type-Options` headers.
 - **`state` binding (fixed)**: the authorization flow's internal lookup key is now always server-generated, never the client-supplied `state` value (which is tracked separately and echoed back untouched, per spec).
 - **No login throttling (fixed)**: `POST /login/callback` now locks out an IP for 15 minutes after 5 failed attempts.
