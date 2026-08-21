@@ -1,7 +1,5 @@
 # halaxy-mcp
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/ryanhunt-halaxy-mcp-ose55a)](https://m8ven.ai/mcp/ryanhunt-halaxy-mcp-ose55a)
-
 An [MCP](https://modelcontextprotocol.io) server for the [Halaxy](https://www.halaxy.com/) practice-management API, written in Python. It lets an MCP client (Claude, GitHub Copilot, etc.) answer questions like "what's on my calendar today", "which of today's appointments haven't been invoiced yet", or "what invoices are outstanding with a given insurer", by talking to your own Halaxy account.
 
 This is a small, single-tenant tool built for one practice's own use, not a general-purpose Halaxy SDK - see [What it deliberately doesn't do](#what-it-deliberately-doesnt-do) below.
@@ -261,3 +259,5 @@ This wraps a handful of read-only endpoints matching one practice's own needs, n
 ## License
 
 GPLv3 - see [LICENSE](LICENSE). See also [DISCLAIMER.md](DISCLAIMER.md) - no warranty, do your own research before deploying this with real patient data.
+
+[![M8ven Score](https://m8ven.ai/badge/mcp/ryanhunt-halaxy-mcp-ose55a?v=ca92d2d8b2f0350d41bcf7286ef0ff49)](https://m8ven.ai/mcp/ryanhunt-halaxy-mcp-ose55a)
