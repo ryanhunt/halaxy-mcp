@@ -144,6 +144,17 @@ LOGIN_STATE_TTL_SECONDS = 10 * 60
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCKOUT_SECONDS = 15 * 60
 
+# Access tokens are short-lived on purpose (limits how long a leaked one is
+# useful for) - but without a refresh token, an MCP client has no way to
+# renew one silently, and has to send the human back through the full
+# interactive /login page every single time it expires. Refresh tokens
+# fix that: a client exchanges its (rotated on every use, per OAuth 2.1's
+# requirement for public clients) refresh token for a fresh access token
+# in the background, so a human only sees the login page again once every
+# REFRESH_TOKEN_TTL_SECONDS, not every ACCESS_TOKEN_TTL_SECONDS.
+ACCESS_TOKEN_TTL_SECONDS = 60 * 60
+REFRESH_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60
+
 # Where registered OAuth clients + issued access tokens are persisted, so
 # a docker-compose restart/rebuild (which happens on every code update)
 # doesn't silently invalidate every connected client's session - confirmed
@@ -325,12 +336,24 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
     (see `register_client`), login attempts are throttled per source IP
     (see `handle_login_callback`), and `requirements.txt` now floors on
     the `mcp` version that actually has `subject`.
+
+    Also issues real refresh tokens now (rotated on every use, per OAuth
+    2.1's requirement for public clients - see `exchange_refresh_token`).
+    Originally this raised NotImplementedError, on the theory that
+    reconnecting occasionally was an acceptable simplification - in
+    practice that meant every client had to redo the full interactive
+    /login page every time its 1-hour access token expired, not just
+    reconnect once. A refresh token lets a client renew silently in the
+    background instead, so a human only sees the login page again once
+    every REFRESH_TOKEN_TTL_SECONDS (90 days), not every
+    ACCESS_TOKEN_TTL_SECONDS (1 hour).
     """
 
     def __init__(self):
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.tokens: dict[str, AccessToken] = {}
+        self.refresh_tokens: dict[str, RefreshToken] = {}
         self.state_mapping: dict[str, dict[str, str | None]] = {}
         # Per-source-IP login throttle - deliberately NOT persisted, same
         # reasoning as state_mapping: a restart clearing it is a fine
@@ -364,6 +387,11 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
             for token, t in data.get("tokens", {}).items()
             if not t["expires_at"] or t["expires_at"] > now
         }
+        self.refresh_tokens = {
+            token: RefreshToken.model_validate(t)
+            for token, t in data.get("refresh_tokens", {}).items()
+            if not t["expires_at"] or t["expires_at"] > now
+        }
 
     def _save(self) -> None:
         """Write clients/codes/tokens to disk - called after every mutation, not just on shutdown.
@@ -378,6 +406,7 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
             "clients": {client_id: c.model_dump(mode="json") for client_id, c in self.clients.items()},
             "auth_codes": {code: c.model_dump(mode="json") for code, c in self.auth_codes.items()},
             "tokens": {token: t.model_dump(mode="json") for token, t in self.tokens.items()},
+            "refresh_tokens": {token: t.model_dump(mode="json") for token, t in self.refresh_tokens.items()},
         }
         tmp_path = path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(data))
@@ -448,8 +477,16 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
             token=token,
             client_id=client.client_id,
             scopes=authorization_code.scopes,
-            expires_at=int(time.time()) + 3600,
+            expires_at=int(time.time()) + ACCESS_TOKEN_TTL_SECONDS,
             resource=authorization_code.resource,
+            subject=authorization_code.subject,
+        )
+        refresh_token = f"mcp_refresh_{secrets.token_hex(32)}"
+        self.refresh_tokens[refresh_token] = RefreshToken(
+            token=refresh_token,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + REFRESH_TOKEN_TTL_SECONDS,
             subject=authorization_code.subject,
         )
         del self.auth_codes[authorization_code.code]
@@ -458,8 +495,9 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
         return OAuthToken(
             access_token=token,
             token_type="Bearer",
-            expires_in=3600,
+            expires_in=ACCESS_TOKEN_TTL_SECONDS,
             scope=" ".join(authorization_code.scopes),
+            refresh_token=refresh_token,
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
@@ -473,16 +511,62 @@ class _SimpleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, R
         return access_token
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
-        return None
+        token = self.refresh_tokens.get(refresh_token)
+        if not token or token.client_id != client.client_id:
+            return None
+        if token.expires_at and token.expires_at < time.time():
+            del self.refresh_tokens[refresh_token]
+            self._save()
+            return None
+        return token
 
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        raise NotImplementedError("Refresh tokens aren't supported - reconnect the connector instead")
+        if refresh_token.token not in self.refresh_tokens:
+            raise ValueError("Invalid refresh token")
+
+        # Rotate on every use - the old refresh token is dead the moment a
+        # new one is issued, per OAuth 2.1's requirement for public clients
+        # (this server doesn't distinguish public/confidential clients, so
+        # applies it uniformly). Limits how long a stolen refresh token
+        # stays useful: the legitimate client's next real refresh silently
+        # invalidates a copy an attacker made, rather than both living on
+        # side by side indefinitely.
+        del self.refresh_tokens[refresh_token.token]
+
+        new_access_token = f"mcp_{secrets.token_hex(32)}"
+        self.tokens[new_access_token] = AccessToken(
+            token=new_access_token,
+            client_id=client.client_id,
+            scopes=scopes or refresh_token.scopes,
+            expires_at=int(time.time()) + ACCESS_TOKEN_TTL_SECONDS,
+            subject=refresh_token.subject,
+        )
+        new_refresh_token = f"mcp_refresh_{secrets.token_hex(32)}"
+        self.refresh_tokens[new_refresh_token] = RefreshToken(
+            token=new_refresh_token,
+            client_id=client.client_id,
+            scopes=scopes or refresh_token.scopes,
+            expires_at=int(time.time()) + REFRESH_TOKEN_TTL_SECONDS,
+            subject=refresh_token.subject,
+        )
+        self._save()
+
+        return OAuthToken(
+            access_token=new_access_token,
+            token_type="Bearer",
+            expires_in=ACCESS_TOKEN_TTL_SECONDS,
+            scope=" ".join(scopes or refresh_token.scopes),
+            refresh_token=new_refresh_token,
+        )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         if token.token in self.tokens:
             del self.tokens[token.token]
+            self._save()
+        elif token.token in self.refresh_tokens:
+            del self.refresh_tokens[token.token]
             self._save()
 
     def login_page_html(self, state: str, client_name: str, redirect_uri: str) -> str:
@@ -1273,9 +1357,14 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     just the bare Halaxy ID already carried on the appointment itself, no
     Patient endpoint call involved, and no name/phone/email/DOB/anything
     else about who that ID belongs to is ever returned (see module
-    docstring for why even a name is withheld). A session's own
-    `description` is withheld for the same reason (staff sometimes put a
-    client's name or a clinical note into it) - only meetings return one.
+    docstring for why even a name is withheld). `description` is never
+    returned at all, for a session OR a meeting - staff put client names
+    and clinical detail into both (confirmed live: a real meeting titled
+    "Case conference with <client's name>"), so having no Patient
+    participant doesn't make a meeting's free text safe to pass through
+    either. `availability_hint` (meetings only, below) is the one thing
+    still derived from that text - only its non-identifying verdict is
+    returned, never the text itself.
 
     IMPORTANT for answering identity-style questions ("who is my 2pm
     with", "who's <time>'s session"): this tool cannot tell you who a
@@ -1341,10 +1430,11 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     approximation available, offered as a hint.
 
     Returns:
-        JSON with the target date, each appointment's type, time,
-        description (meetings only - null for sessions), session mode,
-        patient_id (bare Halaxy ID, never a name, or null for a meeting),
-        practitioner name (and role ID), linked invoice details including
+        JSON with the target date, each appointment's type, time (never
+        the raw `description`, for either type - see above), session
+        mode, patient_id (bare Halaxy ID, never a name, or null for a
+        meeting), practitioner name (and role ID), linked invoice details
+        including
         funding_type (or null), awaiting_insurer_invoice, referrals, and
         (meetings only) availability_hint - plus `cancelled_count`
         (excluded from `appointments` itself).
@@ -1378,12 +1468,17 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
                 "appointment_type": this_type,
                 "start": appt.get("start"),
                 "end": appt.get("end"),
-                # Session descriptions are free text staff can (and do) put a
-                # client's name or clinical notes into - withheld for the same
-                # reason patient names are (see module docstring). Meetings
-                # never have a Patient participant, so their description
-                # isn't patient data and stays.
-                "description": appt.get("description") if this_type == "meeting" else None,
+                # Raw `description` text - for sessions AND meetings - is
+                # never returned, full stop. It's free text staff can (and
+                # do) put a client's name or clinical detail into - a real
+                # example seen live: a meeting titled "Case conference with
+                # <client's name>". Meetings having no Patient participant
+                # doesn't mean their description can't still name a client,
+                # so "not sure" here means "withhold", not "guess it's
+                # fine". `_meeting_availability_hint` below still reads the
+                # raw text internally to classify a meeting - that's the
+                # one place description content is used at all, and only
+                # its (non-identifying) verdict is ever returned.
                 "session_mode": (
                     _get_healthcare_service_name(service_id)
                     if (service_id := _healthcare_service_id(appt))

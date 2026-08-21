@@ -1,5 +1,7 @@
 # halaxy-mcp
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/ryanhunt-halaxy-mcp-ose55a)](https://m8ven.ai/mcp/ryanhunt-halaxy-mcp-ose55a)
+
 An [MCP](https://modelcontextprotocol.io) server for the [Halaxy](https://www.halaxy.com/) practice-management API, written in Python. It lets an MCP client (Claude, GitHub Copilot, etc.) answer questions like "what's on my calendar today", "which of today's appointments haven't been invoiced yet", or "what invoices are outstanding with a given insurer", by talking to your own Halaxy account.
 
 This is a small, single-tenant tool built for one practice's own use, not a general-purpose Halaxy SDK - see [What it deliberately doesn't do](#what-it-deliberately-doesnt-do) below.
@@ -48,7 +50,7 @@ This server never returns a patient's name, phone number, email, DOB, address, g
 This is a deliberate privacy-law decision, not just "no DOB/address/gender": for a psychology practice, a client's *name* tied to a session is itself health information under Australia's Privacy Act, and health service providers don't get the small-business exemption other businesses can rely on regardless of size. Disclosing that to a third-party AI vendor's servers needs its own lawful basis - a legal/policy question for the practice running this, not something this server should quietly decide by exposing the data. Concretely:
 
 - No tool returns a patient's name, phone, or email, and no tool answers "who is this session/invoice/referral with" - only a `patient_id` plus non-identifying facts (`funding_type`, `session_mode`, referral limits).
-- Invoice titles and session `description` fields - free text Halaxy lets staff put a client's name into - are withheld too, not just structured Patient fields. `funding_type` (`"self"` vs. `"organisation"`) gives you the self-funded/insurer-funded distinction without a name.
+- `description` is withheld for both sessions and meetings, full stop - it's free text staff can put a client's name into either way. `funding_type` (`"self"` vs. `"organisation"`) gives you the self-funded/insurer-funded distinction without a name.
 - Every tool's own docstring instructs the calling model on how to answer identity-style questions ("who is my 2pm with") without guessing - though that's guidance for the model, not a substitute for there simply being no name in the data to relay.
 
 Widening this deliberately (re-enabling `Patients → Retrieve` and what `halaxy_mcp.py` returns) is a decision to make on purpose, not something that should happen by accident.
@@ -148,7 +150,7 @@ For a remote MCP client that connects from cloud infrastructure rather than a lo
 
 **Auth**: real OAuth 2.1 with Dynamic Client Registration, not a static token - leave any "OAuth Client ID/Secret" fields in your MCP client blank, since there's no pre-registered client to use instead.
 
-This server acts as its own minimal, self-contained OAuth authorization server (adapted from Anthropic's reference pattern, [`examples/servers/simple-auth`](https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/servers/simple-auth)). Registered clients and access tokens are **persisted to a small JSON file** (`MCP_OAUTH_STATE_FILE`; in Docker this points at `/data`, mounted as a volume) so a redeploy doesn't force every connected client to reconnect. That file holds live access tokens, so it's `0600`-permissioned, written atomically, gitignored, and never baked into the image. "Signing in" is one shared username/password (`MCP_LOGIN_USERNAME`/`MCP_LOGIN_PASSWORD`) - fine for a small practice, not a per-person identity system. `MCP_PUBLIC_URL` is the public HTTPS URL clients reach this server at (behind Caddy) - the OAuth issuer/redirect base, not the same as the internal `MCP_HOST`/`MCP_PORT`.
+This server acts as its own minimal, self-contained OAuth authorization server (adapted from Anthropic's reference pattern, [`examples/servers/simple-auth`](https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/servers/simple-auth)). Registered clients and access tokens are **persisted to a small JSON file** (`MCP_OAUTH_STATE_FILE`; in Docker this points at `/data`, mounted as a volume) so a redeploy doesn't force every connected client to reconnect. That file holds live access tokens, so it's `0600`-permissioned, written atomically, gitignored, and never baked into the image. "Signing in" is one shared username/password (`MCP_LOGIN_USERNAME`/`MCP_LOGIN_PASSWORD`) - fine for a small practice, not a per-person identity system. Access tokens last 1 hour; clients renew silently using a refresh token (rotated on every use) instead of resurfacing the login page each time - only once every 90 days does a human need to sign in again. `MCP_PUBLIC_URL` is the public HTTPS URL clients reach this server at (behind Caddy) - the OAuth issuer/redirect base, not the same as the internal `MCP_HOST`/`MCP_PORT`.
 
 ### Security hardening (credit: Igal Belkin, GrowInsight)
 
@@ -167,6 +169,8 @@ Igal Belkin (GrowInsight) independently security-reviewed this server's OAuth im
 - The login page HTML-escapes everything it renders, rejects an unrecognised `state` outright, and sends `Content-Security-Policy`/`X-Frame-Options`/`X-Content-Type-Options` headers.
 - `POST /login/callback` locks out an IP for 15 minutes after 5 failed attempts.
 - `requirements.txt` floors on `mcp>=1.27.2`.
+- `description` is never returned for a meeting, not just a session - a real meeting titled with a client's name showed this was still possible even with no linked Patient. Only its `availability_hint` verdict comes back, never the underlying text.
+- Real refresh tokens are now issued (rotated on every use) - previously every client had to redo the full interactive login every time its 1-hour access token expired.
 
 **Test locally** (no TLS - fine for local testing, not for internet exposure):
 
