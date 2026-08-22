@@ -1325,18 +1325,41 @@ NON_WORKING_MEETING_KEYWORDS = (
 # expose the text that triggered it.
 CASE_CONFERENCE_PREFIXES = ("CASE CONFERENCE", "CC WITH")
 
+# Halaxy support's own answer (Reference 410049, 21 Aug 2026) on why the
+# calendar's free-typed Title never comes back from the API at all: it
+# isn't stored as a queryable field, full stop - the only way to get
+# anything title-like via the API is to link the appointment to a named
+# "appointment type" when booking it, which then surfaces through
+# `supportingInformation` (the same mechanism already used for F2F/
+# Telehealth - see `_healthcare_service_id`/`_get_healthcare_service_name`).
+# That's a *category* a practice defines once and reuses, not per-booking
+# free text, which is exactly why it's safe to trust here in a way raw
+# `description` text never was: a shared label like "Case Conference"
+# can't accidentally contain a client's name the way typing one
+# appointment's own Title or Comments can.
+CASE_CONFERENCE_SERVICE_NAMES = ("CASE CONFERENCE",)
 
-def _meeting_category(description: str | None) -> str | None:
+
+def _meeting_category(description: str | None, service_name: str | None = None) -> str | None:
     """Categorise a meeting by *type* only - never by exposing its description, per module docstring.
 
-    "case_conference" is the one category recognised so far. Checked as
-    a prefix match, not a substring search: the goal is reading a
-    meeting's declared type off the front of its description, not
-    scanning arbitrary free text for a word that happens to also confirm
-    nothing else about who the meeting concerns. Returns None for
-    anything else - most meetings have no recognised category, which is
-    the expected, unremarkable case, not a sign this should try harder.
+    "case_conference" is the one category recognised so far, matched two
+    ways:
+    1. `service_name` - the linked appointment type's name, if the
+       meeting was booked against one (see CASE_CONFERENCE_SERVICE_NAMES
+       above). Preferred when present: it's a controlled, reusable label
+       the practice defines, not free text typed per-meeting.
+    2. Failing that, `description` checked as a PREFIX (not a substring
+       search) against CASE_CONFERENCE_PREFIXES - the goal is reading a
+       meeting's declared type off the front of its Comments, not
+       scanning arbitrary free text for a word that happens to also
+       confirm nothing else about who the meeting concerns.
+    Returns None for anything else - most meetings have no recognised
+    category, which is the expected, unremarkable case, not a sign this
+    should try harder.
     """
+    if service_name and service_name.strip().upper() in CASE_CONFERENCE_SERVICE_NAMES:
+        return "case_conference"
     text = (description or "").strip().upper()
     if text.startswith(CASE_CONFERENCE_PREFIXES):
         return "case_conference"
@@ -1475,12 +1498,17 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
     approximation available, offered as a hint.
 
     Meetings also carry `meeting_category` - `"case_conference"` when
-    the description *starts with* "Case Conference" or "CC with" (a
-    prefix check, not a substring search), else null. This is
-    deliberately a category label, not the description itself: a case
-    conference's description always names a client (that's the point of
-    the meeting), so the answer to "does the practitioner have a case
-    conference today" is meant to be yes/no, never who it's about.
+    either (a) the meeting is linked to an appointment type named "Case
+    Conference" (confirmed with Halaxy support: this is the only
+    API-visible way to get anything title-like, since a calendar
+    entry's free-typed Title itself isn't queryable at all - only its
+    Comments are, under `description`) or (b) failing that, the
+    Comments *start with* "Case Conference" or "CC with" (a prefix
+    check, not a substring search). Either way this is deliberately a
+    category label, never the underlying text: a case conference's
+    Title/Comments name a client (that's the point of the meeting), so
+    the answer to "does the practitioner have a case conference today"
+    is meant to be yes/no, never who it's about.
 
     Returns:
         JSON with the target date, each appointment's type, time (never
@@ -1515,6 +1543,12 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
         this_type = "session" if refs["patient_id"] else "meeting"
         if appointment_type and this_type != appointment_type:
             continue
+        # Resolved once, shared by session_mode (F2F/Telehealth, sessions)
+        # and meeting_category (below) - both read the same linked
+        # appointment-type name, just interpreting it differently.
+        service_name = (
+            _get_healthcare_service_name(service_id) if (service_id := _healthcare_service_id(appt)) else None
+        )
         parsed.append(
             {
                 "appointment_id": appt.get("id"),
@@ -1532,11 +1566,7 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
                 # raw text internally to classify a meeting - that's the
                 # one place description content is used at all, and only
                 # its (non-identifying) verdict is ever returned.
-                "session_mode": (
-                    _get_healthcare_service_name(service_id)
-                    if (service_id := _healthcare_service_id(appt))
-                    else None
-                ),
+                "session_mode": service_name,
                 "patient_id": refs["patient_id"],
                 "practitioner_role_id": refs["practitioner_role_id"],
                 "practitioner_name": practitioner_role_names.get(refs["practitioner_role_id"], {}).get("name"),
@@ -1545,7 +1575,7 @@ def list_appointments(date: str | None = None, appointment_type: str | None = No
                     _meeting_availability_hint(appt.get("description")) if this_type == "meeting" else None
                 ),
                 "meeting_category": (
-                    _meeting_category(appt.get("description")) if this_type == "meeting" else None
+                    _meeting_category(appt.get("description"), service_name) if this_type == "meeting" else None
                 ),
             }
         )

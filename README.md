@@ -20,9 +20,7 @@ All five carry the standard [MCP tool annotation hints](https://modelcontextprot
 
   Cancelled appointments are excluded entirely (`cancelled_count` reports how many) - detected via the Patient participant's `appointment-participant-status` **modifierExtension** (not `extension`), since the top-level `cancellationReason` field alone isn't reliable.
 
-  Meetings also carry `availability_hint` - a best-effort *guess* at whether the meeting is non-working/blocked time, matching keywords in `description` or a blank description. **This is not a real Halaxy field and not availability data** - `likely_non_working: true` must never be read as "free to book a client into".
-
-  Meetings also carry `meeting_category` - `"case_conference"` when the description *starts with* "Case Conference" or "CC with" (a prefix check, not a substring search), else `null`. This answers "does the practitioner have a case conference today" without ever exposing who it's with.
+  Meetings also carry `availability_hint` and `meeting_category` - see [Practice-specific behaviour](#practice-specific-behaviour) below.
 - **`list_practitioners()`** - clinical staff, each with their PractitionerRole ID and name.
 - **`list_invoices_by_payer(payer_name)`** - every invoice ever billed to a specific insurer/employer/organisation (e.g. "Acme Insurance"), not tied to any date - searches Halaxy's `Invoice?recipient=` directly, so it doesn't have `list_invoices`'s lookback-window blind spot (see below).
 - **`list_referrals(flag)`** - every active Referral in the practice - Halaxy's model for a GP/other referral authorizing a set number of sessions and/or dollars under a funding scheme (Medicare Mental Health Treatment Plan, DVA, WorkCover, etc). Each carries a `patient_id`, `sessions_total`/`sessions_used`/`sessions_remaining`, `amount_total`/`amount_used`, expiry, and computed `flags`: `"over_limit"`, `"expiring_soon"` (within 30 days), `"expired"`. Optionally filter to just one flag.
@@ -56,6 +54,19 @@ This is a deliberate privacy-law decision, not just "no DOB/address/gender": for
 - Every tool's own docstring instructs the calling model on how to answer identity-style questions ("who is my 2pm with") without guessing - though that's guidance for the model, not a substitute for there simply being no name in the data to relay.
 
 Widening this deliberately (re-enabling `Patients → Retrieve` and what `halaxy_mcp.py` returns) is a decision to make on purpose, not something that should happen by accident.
+
+## Practice-specific behaviour
+
+This section covers behavior specific to how this particular practice uses Halaxy, not general-purpose MCP/FHIR handling - kept separate so it's easy to skip if you're adapting this for a different practice's own conventions.
+
+A "meeting" here (no linked Patient) still carries two best-effort, non-identifying signals derived from data this server otherwise withholds entirely:
+
+- **`availability_hint`** - a guess at whether the meeting is non-working/blocked time (a break, leave, etc.), based on keywords ("break", "block", "leave", "lunch", "holiday", "ooo", "out of office", "unavailable") or a *completely blank* Comments field. Neither is a real Halaxy field - Halaxy's own calendar shows generic blocker titles (e.g. "BREAK") for meetings whose API-visible Comments come back blank, which is why a blank field is treated as weak evidence too, not just an explicit keyword. **`likely_non_working: true` must never be read as "free to book a client into"** - this server has no access to real Halaxy availability data.
+- **`meeting_category`** - currently just `"case_conference"`, else `null`. Two ways this can be detected, checked in order:
+  1. The meeting is linked to an **appointment type** named "Case Conference" - confirmed with Halaxy support that this is the *only* API-visible way to categorise a meeting at all, since a calendar entry's free-typed Title isn't queryable through the API under any field (only its Comments are, and those map to `description` - a genuinely different field to Title, despite similar naming in Halaxy's own schema docs). If your practice wants this to work reliably, link a "Case Conference" appointment type when booking these meetings, the same way F2F/Telehealth already works for sessions.
+  2. Failing that, the Comments field *starts with* "Case Conference" or "CC with" (a prefix check, not a substring search - a meeting that merely mentions either phrase mid-sentence won't trigger it).
+
+  Either path only ever returns the category label. The Title and Comments text that triggered it are never returned, the same as any other meeting.
 
 **Clinical/session notes are not retrievable through this API at all, for any key or scope** - Halaxy's `DocumentReference` resource supports `create`/`patch` only, no read. A whole-API limitation, not something this server chooses not to expose.
 
